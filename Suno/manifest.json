@@ -24,7 +24,7 @@
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://suhbway.kr/prompt_detail.php*"],
+      "matches": ["https://suhbway.kr/*"],
       "js": ["content-suhbway.js"],
       "css": ["styles-suhbway.css"],
       "run_at": "document_idle"
