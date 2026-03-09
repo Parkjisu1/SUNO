@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "Suno Helper",
+  "version": "2.0.0",
+  "description": "Auto-fill Suno from suhbway.kr prompts & save to GitHub",
+  "permissions": ["storage", "tabs"],
+  "host_permissions": [
+    "https://api.github.com/*",
+    "https://suno.com/*",
+    "https://suhbway.kr/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": "icon48.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://suno.com/*"],
+      "js": ["content-suno.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://suhbway.kr/prompt_detail.php*"],
+      "js": ["content-suhbway.js"],
+      "css": ["styles-suhbway.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}
