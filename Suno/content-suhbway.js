@@ -130,23 +130,37 @@
     var lyricsEl = document.getElementById('lyricsContent');
     var lyrics = lyricsEl ? (lyricsEl.textContent || '').trim() : '';
 
-    // 3) Exclude Styles - find section with "Exclude" heading
+    // 3) Exclude Styles - find any element with "Exclude" label text, then get sibling value
     var excludeStyles = '';
-    var headings = document.querySelectorAll('h2, h3, h4, strong, .section-title');
-    for (var i = 0; i < headings.length; i++) {
-      var hText = (headings[i].textContent || '').trim().toLowerCase();
+    var allLabels = document.querySelectorAll('h2, h3, h4, strong, span, label, p, .section-title');
+    for (var i = 0; i < allLabels.length; i++) {
+      var hText = (allLabels[i].textContent || '').trim().toLowerCase();
       if (hText.includes('exclude') || hText.includes('제외')) {
-        // Get the content after this heading
-        var next = headings[i].nextElementSibling;
+        // Get the content from next sibling element
+        var next = allLabels[i].nextElementSibling;
         if (next) {
           excludeStyles = (next.textContent || '').trim();
         }
-        // Also check parent's next sibling
+        // Also check parent's siblings
         if (!excludeStyles) {
-          var parentDiv = headings[i].closest('div');
+          var parentDiv = allLabels[i].closest('div');
           if (parentDiv) {
+            // Check next sibling of parent
             var nextDiv = parentDiv.nextElementSibling;
             if (nextDiv) excludeStyles = (nextDiv.textContent || '').trim();
+            // Check sibling elements within parent (e.g. <span>label</span><p>value</p>)
+            if (!excludeStyles) {
+              var siblings = parentDiv.children;
+              for (var si = 0; si < siblings.length; si++) {
+                if (siblings[si] !== allLabels[i] && !siblings[si].contains(allLabels[i])) {
+                  var sibText = (siblings[si].textContent || '').trim();
+                  if (sibText && !sibText.toLowerCase().includes('exclude')) {
+                    excludeStyles = sibText;
+                    break;
+                  }
+                }
+              }
+            }
           }
         }
         break;

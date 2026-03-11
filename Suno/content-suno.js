@@ -327,7 +327,10 @@
 
   // ═══════════════════════════════════════
   //  AUTO-FILL from suhbway.kr
+  //  Phased approach: Custom mode → wait → fill each field with retries
   // ═══════════════════════════════════════
+
+  var _filledFields = {};  // Track which fields are already filled this session
 
   async function checkAndFill() {
     var data = await new Promise(function(r) {
@@ -336,280 +339,385 @@
     if (!data.suno_pending_fill) return;
 
     var fill = data.suno_pending_fill;
+    _filledFields = {};
+    console.log('[SunoHelper] Starting auto-fill with data:', JSON.stringify(fill).slice(0, 300));
     showToast('Auto-filling from suhbway.kr...', fill.title || '');
 
-    // First, switch to Custom/Advanced mode
-    switchToCustomMode();
+    // Phase 1: Switch to Custom mode and wait for it to render
+    var modeReady = await waitForCustomMode(8000);
+    console.log('[SunoHelper] Custom mode ready:', modeReady);
 
+    // Phase 2: If exclude styles needed, reveal the section early
+    if (fill.excludeStyles) {
+      revealExcludeStyles();
+      await sleep(800);
+    }
+
+    // Phase 3: Fill with retries - 500ms interval, up to 60 attempts (30s)
     var attempts = 0;
     var tryFill = setInterval(function() {
       attempts++;
 
-      // Keep trying to switch to Custom mode if fields aren't found
-      if (attempts % 5 === 0) switchToCustomMode();
+      // Re-try custom mode switch if no fields found after a while
+      if (attempts % 10 === 0) {
+        switchToCustomMode();
+      }
+      // Re-try revealing exclude styles
+      if (fill.excludeStyles && !_filledFields['Exclude'] && attempts % 8 === 0) {
+        revealExcludeStyles();
+      }
 
       var result = doFill(fill);
-      if ((result.filled && result.allDone) || attempts > 40) {
+
+      if (result.allDone || attempts > 60) {
         clearInterval(tryFill);
-        if (result.filled) {
-          chrome.storage.local.remove('suno_pending_fill');
-          var msg = 'Auto-fill complete!';
-          if (!result.allDone) msg = 'Partial fill (missing: ' + result.pending + ')';
-          showToast(msg, result.details);
+        chrome.storage.local.remove('suno_pending_fill');
+
+        var filledList = Object.keys(_filledFields);
+        if (filledList.length > 0) {
+          var msg = result.allDone ? 'Auto-fill complete!' : 'Partial fill';
+          var detail = 'Filled: ' + filledList.join(', ');
+          if (result.pending) detail += ' | Missing: ' + result.pending;
+          showToast(msg, detail);
+          console.log('[SunoHelper] ' + msg + ' - ' + detail);
         } else {
-          showToast('Auto-fill failed', 'Could not find input fields. Make sure you are in Custom mode.');
+          showToast('Auto-fill failed', 'Could not find input fields. Make sure you are on the Create page in Custom mode.');
+          console.log('[SunoHelper] Auto-fill failed - no fields found after ' + attempts + ' attempts');
         }
       }
     }, 500);
   }
 
+  function sleep(ms) {
+    return new Promise(function(r) { setTimeout(r, ms); });
+  }
+
+  // Wait for Custom mode to be active, returns true if successful
+  async function waitForCustomMode(timeout) {
+    var deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      switchToCustomMode();
+      // Check if we have at least one textarea (lyrics) visible - sign of Custom mode
+      var textareas = document.querySelectorAll('textarea');
+      for (var i = 0; i < textareas.length; i++) {
+        if (isVisibleFormField(textareas[i])) return true;
+      }
+      // Also check contenteditable as fallback
+      var editables = document.querySelectorAll('[contenteditable="true"]');
+      for (var j = 0; j < editables.length; j++) {
+        if (isVisibleFormField(editables[j])) return true;
+      }
+      await sleep(500);
+    }
+    return false;
+  }
+
   function switchToCustomMode() {
-    // Look for Custom / Advanced mode tabs/buttons
-    var candidates = document.querySelectorAll('button, [role="tab"], [role="button"]');
+    // Strategy 1: Look for Custom/Advanced mode tabs/buttons by text
+    var candidates = document.querySelectorAll('button, [role="tab"], [role="button"], [role="radio"], a, div[tabindex]');
     for (var i = 0; i < candidates.length; i++) {
       var text = (candidates[i].textContent || '').trim().toLowerCase();
-      if (text === 'custom' || text === 'advanced' || text === '커스텀' || text === '사용자 지정') {
+      // Match exact or contains "custom" / "advanced"
+      if (text === 'custom' || text === 'advanced' || text === '커스텀' || text === '사용자 지정'
+          || (text.length < 20 && (text.includes('custom') || text.includes('advanced')))) {
         var isActive = candidates[i].getAttribute('aria-selected') === 'true'
           || candidates[i].getAttribute('data-state') === 'active'
-          || candidates[i].classList.contains('active');
+          || candidates[i].getAttribute('aria-checked') === 'true'
+          || candidates[i].classList.contains('active')
+          || candidates[i].classList.contains('selected');
         if (!isActive) {
+          console.log('[SunoHelper] Clicking Custom mode button:', text);
           candidates[i].click();
         }
-        return;
+        return true;
       }
     }
+
+    // Strategy 2: Find segmented control / tab group and click the non-active one
+    var tabGroups = document.querySelectorAll('[role="tablist"], [role="radiogroup"]');
+    for (var g = 0; g < tabGroups.length; g++) {
+      var tabs = tabGroups[g].querySelectorAll('[role="tab"], [role="radio"], button');
+      if (tabs.length === 2) {
+        // Typically: [Simple, Custom] - click the second one
+        var second = tabs[1];
+        var isActive = second.getAttribute('aria-selected') === 'true'
+          || second.getAttribute('data-state') === 'active';
+        if (!isActive) {
+          console.log('[SunoHelper] Clicking second tab in group:', second.textContent.trim());
+          second.click();
+        }
+        return true;
+      }
+    }
+
+    return false;
   }
 
   function doFill(fill) {
-    var filled = false;
-    var details = [];
     var pending = [];
 
-    // Find all visible textareas and text inputs (excluding our panel and dialogs)
+    // Collect all visible form elements
     var textareas = [];
     var inputs = [];
+    var editables = [];
     document.querySelectorAll('textarea').forEach(function(el) {
       if (isVisibleFormField(el)) textareas.push(el);
     });
-    document.querySelectorAll('input[type="text"], input:not([type])').forEach(function(el) {
+    document.querySelectorAll('input[type="text"], input[type="search"], input:not([type])').forEach(function(el) {
       if (isVisibleFormField(el)) inputs.push(el);
     });
-    // Also check contenteditable divs (some React UIs use these)
-    var editables = [];
     document.querySelectorAll('[contenteditable="true"]').forEach(function(el) {
       if (isVisibleFormField(el)) editables.push(el);
     });
 
     // Sort by vertical position
-    inputs.sort(function(a, b) { return a.getBoundingClientRect().top - b.getBoundingClientRect().top; });
-    textareas.sort(function(a, b) { return a.getBoundingClientRect().top - b.getBoundingClientRect().top; });
+    var byTop = function(a, b) { return a.getBoundingClientRect().top - b.getBoundingClientRect().top; };
+    inputs.sort(byTop);
+    textareas.sort(byTop);
+    editables.sort(byTop);
 
-    // Reveal exclude styles if needed (async - toggle may take time to render)
-    if (fill.excludeStyles) revealExcludeStyles();
-
-    // LYRICS → first visible textarea (or contenteditable)
-    if (fill.lyrics) {
-      var lyricsTarget = null;
-      // Find textarea with lyrics-related label
-      for (var t = 0; t < textareas.length; t++) {
-        var tLabel = getSurroundingText(textareas[t]).toLowerCase();
-        var tPh = (textareas[t].placeholder || '').toLowerCase();
-        if (tLabel.includes('lyric') || tPh.includes('lyric') || tLabel.includes('가사')) {
-          lyricsTarget = textareas[t];
-          break;
-        }
+    // ── LYRICS ──
+    if (fill.lyrics && !_filledFields['Lyrics']) {
+      var lyricsTarget = findFieldByContext(textareas, ['lyric', 'lyrics', '가사', 'write your own']);
+      // Fallback: largest textarea (lyrics is usually the biggest)
+      if (!lyricsTarget && textareas.length > 0) {
+        lyricsTarget = textareas.reduce(function(best, el) {
+          return el.getBoundingClientRect().height > (best ? best.getBoundingClientRect().height : 0) ? el : best;
+        }, null);
       }
-      // Fallback: first textarea
-      if (!lyricsTarget && textareas.length > 0) lyricsTarget = textareas[0];
-      // Fallback: contenteditable
-      if (!lyricsTarget && editables.length > 0) {
-        for (var e = 0; e < editables.length; e++) {
-          var eLabel = getSurroundingText(editables[e]).toLowerCase();
-          if (eLabel.includes('lyric') || eLabel.includes('가사')) {
-            lyricsTarget = editables[e];
-            break;
-          }
-        }
+      // Fallback: contenteditable with lyrics hint
+      if (!lyricsTarget) {
+        lyricsTarget = findFieldByContext(editables, ['lyric', 'lyrics', '가사', 'write your own']);
+        if (!lyricsTarget && editables.length > 0) lyricsTarget = editables[0];
       }
 
       if (lyricsTarget) {
-        if (lyricsTarget.getAttribute('contenteditable')) {
-          lyricsTarget.textContent = fill.lyrics;
-          lyricsTarget.dispatchEvent(new Event('input', { bubbles: true }));
-        } else {
-          setReactValue(lyricsTarget, fill.lyrics);
-        }
-        filled = true;
-        details.push('Lyrics');
+        setFieldValue(lyricsTarget, fill.lyrics);
+        _filledFields['Lyrics'] = true;
+        console.log('[SunoHelper] Filled Lyrics');
       } else {
         pending.push('Lyrics');
       }
     }
 
-    // Categorize text inputs by surrounding labels
-    var styleInput = null;
-    var excludeInput = null;
-    var titleInput = null;
+    // ── Categorize text inputs & textareas ──
+    var styleTarget = null;
+    var excludeTarget = null;
+    var titleTarget = null;
 
+    // Check inputs
     for (var i = 0; i < inputs.length; i++) {
-      var label = getSurroundingText(inputs[i]).toLowerCase();
-      var ph = (inputs[i].placeholder || '').toLowerCase();
-
-      if (label.includes('exclude') || ph.includes('exclude') || label.includes('제외')) {
-        excludeInput = inputs[i];
-      } else if (label.includes('style') || ph.includes('style') || label.includes('genre') || ph.includes('genre') || label.includes('tag')) {
-        if (!styleInput) styleInput = inputs[i];
-      } else if (label.includes('title') || ph.includes('title') || label.includes('제목')) {
-        titleInput = inputs[i];
+      var ctx = getFieldContext(inputs[i]).toLowerCase();
+      if (!excludeTarget && (ctx.includes('exclude') || ctx.includes('negative') || ctx.includes('제외'))) {
+        excludeTarget = inputs[i];
+      } else if (!styleTarget && (ctx.includes('style') || ctx.includes('genre') || ctx.includes('tag') || ctx.includes('music description'))) {
+        styleTarget = inputs[i];
+      } else if (!titleTarget && (ctx.includes('title') || ctx.includes('제목') || ctx.includes('song name'))) {
+        titleTarget = inputs[i];
       }
     }
 
-    // Also check textareas for style (Suno may use textarea for style input)
-    if (!styleInput) {
-      for (var s = 0; s < textareas.length; s++) {
-        var sLabel = getSurroundingText(textareas[s]).toLowerCase();
-        var sPh = (textareas[s].placeholder || '').toLowerCase();
-        if (sLabel.includes('style') || sPh.includes('style') || sLabel.includes('genre') || sPh.includes('tag')) {
-          styleInput = textareas[s];
+    // Also check textareas for style (Suno may use textarea for style)
+    if (!styleTarget) {
+      styleTarget = findFieldByContext(textareas, ['style', 'genre', 'tag', 'music description', 'describe']);
+    }
+
+    // Fallback: first input that isn't exclude or title = style
+    if (!styleTarget && inputs.length > 0) {
+      for (var fi = 0; fi < inputs.length; fi++) {
+        if (inputs[fi] !== excludeTarget && inputs[fi] !== titleTarget) {
+          styleTarget = inputs[fi];
           break;
         }
       }
     }
 
-    // Fallback: first input = style
-    if (!styleInput && inputs.length > 0) styleInput = inputs[0];
-    if (!titleInput && inputs.length > 1) {
-      for (var j = 0; j < inputs.length; j++) {
-        if (inputs[j] !== styleInput && inputs[j] !== excludeInput) {
-          titleInput = inputs[j];
-          break;
-        }
-      }
-    }
-
-    // PROMPT → Style of Music
-    if (fill.prompt) {
-      if (styleInput) {
-        setReactValue(styleInput, fill.prompt);
-        filled = true;
-        details.push('Style');
+    // ── STYLE (Prompt) ──
+    if (fill.prompt && !_filledFields['Style']) {
+      if (styleTarget) {
+        setFieldValue(styleTarget, fill.prompt);
+        _filledFields['Style'] = true;
+        console.log('[SunoHelper] Filled Style');
       } else {
         pending.push('Style');
       }
     }
 
-    // EXCLUDE → Exclude Styles
-    if (fill.excludeStyles) {
-      if (excludeInput) {
-        setReactValue(excludeInput, fill.excludeStyles);
-        filled = true;
-        details.push('Exclude');
+    // ── EXCLUDE STYLES ──
+    if (fill.excludeStyles && !_filledFields['Exclude']) {
+      // Also search textareas in case exclude is a textarea
+      if (!excludeTarget) {
+        excludeTarget = findFieldByContext(textareas, ['exclude', 'negative', '제외']);
+      }
+      if (excludeTarget) {
+        setFieldValue(excludeTarget, fill.excludeStyles);
+        _filledFields['Exclude'] = true;
+        console.log('[SunoHelper] Filled Exclude');
       } else {
         pending.push('Exclude');
       }
     }
 
-    // TITLE
-    if (fill.title) {
-      if (titleInput) {
-        setReactValue(titleInput, fill.title);
-        filled = true;
-        details.push('Title');
+    // ── TITLE ──
+    if (fill.title && !_filledFields['Title']) {
+      if (!titleTarget && inputs.length > 1) {
+        for (var tj = 0; tj < inputs.length; tj++) {
+          if (inputs[tj] !== styleTarget && inputs[tj] !== excludeTarget) {
+            titleTarget = inputs[tj];
+            break;
+          }
+        }
+      }
+      if (titleTarget) {
+        setFieldValue(titleTarget, fill.title);
+        _filledFields['Title'] = true;
+        console.log('[SunoHelper] Filled Title');
       } else {
         pending.push('Title');
       }
     }
 
-    // SLIDERS (Weirdness, Style Influence, Audio Influence)
+    // ── SLIDERS (Weirdness, Style Influence, Audio Influence) ──
     if (fill.params) {
       var sliders = document.querySelectorAll('input[type="range"]');
       sliders.forEach(function(slider) {
         if (slider.offsetParent === null) return;
-        var sLbl = getSurroundingText(slider).toLowerCase();
-        if (sLbl.includes('weird') && fill.params.weirdness != null) {
-          setReactValue(slider, String(fill.params.weirdness));
-          details.push('Weirdness');
-        } else if (sLbl.includes('style') && !sLbl.includes('exclude') && fill.params.styleInfluence != null) {
-          setReactValue(slider, String(fill.params.styleInfluence));
-          details.push('StyleInfl');
-        } else if (sLbl.includes('audio') && fill.params.audioInfluence != null) {
-          setReactValue(slider, String(fill.params.audioInfluence));
-          details.push('AudioInfl');
+        var sCtx = getFieldContext(slider).toLowerCase();
+
+        if (!_filledFields['Weirdness'] && sCtx.includes('weird') && fill.params.weirdness != null) {
+          setFieldValue(slider, String(fill.params.weirdness));
+          _filledFields['Weirdness'] = true;
+          console.log('[SunoHelper] Filled Weirdness:', fill.params.weirdness);
+        } else if (!_filledFields['StyleInfl'] && sCtx.includes('style') && !sCtx.includes('exclude') && fill.params.styleInfluence != null) {
+          setFieldValue(slider, String(fill.params.styleInfluence));
+          _filledFields['StyleInfl'] = true;
+          console.log('[SunoHelper] Filled StyleInfluence:', fill.params.styleInfluence);
+        } else if (!_filledFields['AudioInfl'] && sCtx.includes('audio') && fill.params.audioInfluence != null) {
+          setFieldValue(slider, String(fill.params.audioInfluence));
+          _filledFields['AudioInfl'] = true;
+          console.log('[SunoHelper] Filled AudioInfluence:', fill.params.audioInfluence);
         }
       });
     }
 
-    return { filled: filled, allDone: pending.length === 0, details: details.join(', '), pending: pending.join(', ') };
+    return { allDone: pending.length === 0, pending: pending.join(', ') };
+  }
+
+  // Find a field whose context matches any of the keywords
+  function findFieldByContext(elements, keywords) {
+    for (var i = 0; i < elements.length; i++) {
+      var ctx = getFieldContext(elements[i]).toLowerCase();
+      for (var k = 0; k < keywords.length; k++) {
+        if (ctx.includes(keywords[k])) return elements[i];
+      }
+    }
+    return null;
+  }
+
+  // Set value on any form element (textarea, input, contenteditable)
+  function setFieldValue(el, value) {
+    if (el.getAttribute('contenteditable') === 'true') {
+      el.focus();
+      el.textContent = value;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return;
+    }
+    setReactValue(el, value);
   }
 
   function isVisibleFormField(el) {
-    if (el.offsetParent === null && el.offsetWidth === 0) return false;
+    // Accept elements that are in the DOM tree even if not yet fully painted
     if (el.closest('#suno-git-panel')) return false;
+    if (el.closest('#suno-fill-toast')) return false;
     if (el.closest('[role="dialog"]')) return false;
     if (el.closest('nav')) return false;
+    // Skip header/footer areas
+    if (el.closest('header')) return false;
+    if (el.closest('footer')) return false;
     // Skip search inputs
     var ph = (el.placeholder || '').toLowerCase();
     if (ph.includes('search') || ph.includes('검색')) return false;
+    // Check basic visibility
+    var rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0 && el.offsetParent === null) return false;
     return true;
   }
 
-  function getSurroundingText(el) {
+  // Get all contextual text around a form field (labels, siblings, placeholders, aria)
+  function getFieldContext(el) {
     var texts = [];
+
+    // Direct attributes
     if (el.placeholder) texts.push(el.placeholder);
+    if (el.name) texts.push(el.name);
     var aria = el.getAttribute('aria-label');
     if (aria) texts.push(aria);
+    var ariaDesc = el.getAttribute('aria-describedby');
+    if (ariaDesc) {
+      var descEl = document.getElementById(ariaDesc);
+      if (descEl) texts.push(descEl.textContent.trim());
+    }
 
-    // Check for associated label
+    // Associated <label>
     var id = el.id;
     if (id) {
       var labelEl = document.querySelector('label[for="' + id + '"]');
       if (labelEl) texts.push(labelEl.textContent.trim());
     }
 
+    // Walk up to 7 parent levels looking for sibling labels/headings
     var parent = el.parentElement;
-    for (var i = 0; i < 5 && parent; i++) {
+    for (var i = 0; i < 7 && parent; i++) {
+      // Don't go above main content area
+      if (parent.tagName === 'BODY' || parent.tagName === 'MAIN') break;
+
       var children = parent.children;
       for (var j = 0; j < children.length; j++) {
         if (children[j] === el || children[j].contains(el)) continue;
         var tag = children[j].tagName;
-        if (tag === 'LABEL' || tag === 'SPAN' || tag === 'P' || tag === 'DIV' || tag === 'H3' || tag === 'H4') {
+        if (tag === 'LABEL' || tag === 'SPAN' || tag === 'P' || tag === 'DIV'
+            || tag === 'H1' || tag === 'H2' || tag === 'H3' || tag === 'H4' || tag === 'H5'
+            || tag === 'LEGEND' || tag === 'STRONG' || tag === 'SMALL') {
           var t = (children[j].textContent || '').trim();
-          if (t.length > 0 && t.length < 60) texts.push(t);
+          if (t.length > 0 && t.length < 80) texts.push(t);
         }
       }
       parent = parent.parentElement;
     }
+
     return texts.join(' ');
   }
 
   function revealExcludeStyles() {
-    // Look for the Exclude Styles toggle switch
-    var toggles = document.querySelectorAll('button, [role="button"], [role="switch"], div[tabindex], label');
-    for (var i = 0; i < toggles.length; i++) {
-      var text = (toggles[i].textContent || '').toLowerCase();
-      var aria = (toggles[i].getAttribute('aria-label') || '').toLowerCase();
-      if (text.includes('exclude') || aria.includes('exclude') || text.includes('제외')) {
-        var isChecked = toggles[i].getAttribute('aria-checked');
-        var dataState = toggles[i].getAttribute('data-state');
+    // Strategy 1: Find toggle/switch for exclude styles
+    var clickables = document.querySelectorAll('button, [role="button"], [role="switch"], [role="checkbox"], div[tabindex], label, span[tabindex]');
+    for (var i = 0; i < clickables.length; i++) {
+      var text = (clickables[i].textContent || '').toLowerCase();
+      var aria = (clickables[i].getAttribute('aria-label') || '').toLowerCase();
+      if (text.includes('exclude') || aria.includes('exclude') || text.includes('negative') || text.includes('제외')) {
+        var isChecked = clickables[i].getAttribute('aria-checked');
+        var dataState = clickables[i].getAttribute('data-state');
         if (isChecked === 'false' || dataState === 'unchecked' || (!isChecked && !dataState)) {
-          toggles[i].click();
+          console.log('[SunoHelper] Toggling exclude styles ON');
+          clickables[i].click();
         }
         return;
       }
     }
-    // Try "More Options" or similar expandable sections
-    for (var j = 0; j < toggles.length; j++) {
-      var mt = (toggles[j].textContent || '').toLowerCase();
-      if (mt.includes('more option') || mt.includes('advanced') || mt.includes('추가 옵션')) {
-        toggles[j].click();
-        setTimeout(revealExcludeStyles, 600);
+    // Strategy 2: Try "More Options" / expandable sections
+    for (var j = 0; j < clickables.length; j++) {
+      var mt = (clickables[j].textContent || '').toLowerCase();
+      if (mt.includes('more option') || mt.includes('advanced') || mt.includes('추가 옵션') || mt.includes('show more')) {
+        clickables[j].click();
+        setTimeout(revealExcludeStyles, 800);
         return;
       }
     }
   }
 
   function setReactValue(el, value) {
-    // Use native property setter to bypass React's controlled input
+    // Determine the right prototype for native setter
     var proto;
     if (el.tagName === 'TEXTAREA') {
       proto = HTMLTextAreaElement.prototype;
@@ -618,6 +726,13 @@
     } else {
       proto = HTMLInputElement.prototype;
     }
+
+    // Step 1: Focus the element
+    el.focus();
+    el.dispatchEvent(new Event('focus', { bubbles: true }));
+    el.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+
+    // Step 2: Set value via native setter (bypasses React's synthetic getter/setter)
     var nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value');
     if (nativeSetter && nativeSetter.set) {
       nativeSetter.set.call(el, value);
@@ -625,16 +740,31 @@
       el.value = value;
     }
 
-    // Reset React's value tracker so it detects the change
+    // Step 3: Reset React's internal value tracker so it sees the change
     var tracker = el._valueTracker;
-    if (tracker) tracker.setValue('');
+    if (tracker) {
+      tracker.setValue('');
+    }
+    // Also try resetting via React fiber (React 18+)
+    var fiberKey = Object.keys(el).find(function(k) {
+      return k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$');
+    });
+    if (fiberKey) {
+      var fiber = el[fiberKey];
+      if (fiber && fiber.memoizedProps) {
+        // Force React to see the value as changed
+        var prevValue = fiber.memoizedProps.value;
+        if (prevValue !== undefined) {
+          fiber.memoizedProps.value = '';
+        }
+      }
+    }
 
-    // Dispatch events to trigger React state update
-    el.dispatchEvent(new Event('focus', { bubbles: true }));
+    // Step 4: Dispatch full event sequence
+    // React listens to different events depending on version
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
 
-    // Also try InputEvent for React 17+ compatibility
     try {
       el.dispatchEvent(new InputEvent('input', {
         bubbles: true,
@@ -644,7 +774,17 @@
       }));
     } catch (e) {}
 
+    // For range inputs, also dispatch specific events
+    if (el.type === 'range') {
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      // Simulate mouse events for range sliders
+      el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    }
+
     el.dispatchEvent(new Event('blur', { bubbles: true }));
+    el.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
   }
 
   function showToast(title, sub) {
