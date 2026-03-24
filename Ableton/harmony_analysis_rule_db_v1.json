@@ -1,0 +1,738 @@
+{
+  "schema_version": "1.0",
+  "project_name": "MIDI Harmony Analyzer Rule DB",
+  "purpose": "Rule database and analysis philosophy for a piano accompaniment harmony analyzer that evaluates MIDI against jazz/pop accompaniment rules while remaining sensitive to arpeggio context, melody support, inversion logic, playability, and voice leading.",
+  "design_philosophy": {
+    "summary": [
+      "Do not label harmony only by collecting all sounding pitches equally.",
+      "Separate structural harmony from surface notes.",
+      "In arpeggio/accompaniment contexts, short decorative notes should not automatically force richer chord labels.",
+      "Prefer stable, musically practical chord labels over overly literal pitch-set labels.",
+      "Return a primary label plus alternate candidates with confidence and reasons.",
+      "Melody has higher priority than accompaniment top-note freedom.",
+      "Reject or penalize voicings that are physically impractical or aesthetically muddy on piano.",
+      "Treat rules as weighted preferences, not absolute truth, except for hard constraints."
+    ],
+    "analysis_layers": [
+      {
+        "layer": "structural_harmony",
+        "description": "The main chord identity for the segment/bar/beat.",
+        "examples": ["Dm7", "Fmaj7/A", "Bb", "G7"]
+      },
+      {
+        "layer": "surface_notes",
+        "description": "Passing tones, arpeggio traversal notes, decorative extensions, neighbor tones, suspensions, and melody-driven color notes that do not necessarily redefine the structural chord.",
+        "examples": ["E as 9 over Dm7 in an arpeggio", "F as b13 over Am7 candidate but not primary label"]
+      },
+      {
+        "layer": "contextual_interpretation",
+        "description": "Phrase context, surrounding chords, bass motion, inversion preference, melody relation, and accompaniment style determine the final preferred label."
+      }
+    ],
+    "priority_order": [
+      "melody_protection",
+      "chord_conformity",
+      "human_playability",
+      "voice_leading",
+      "style_consistency",
+      "surface_color_interpretation"
+    ]
+  },
+  "hard_constraints": {
+    "description": "Violations here should reject candidates or heavily penalize them.",
+    "rules": [
+      {
+        "id": "hc_melody_minor9_strong_beat",
+        "type": "melody_clash",
+        "description": "Avoid harsh minor ninth / major seventh clashes between melody and accompaniment top note on strong beats.",
+        "forbidden_intervals_semitones": [1, -1, 11, -11, 13, -13],
+        "severity": "high"
+      },
+      {
+        "id": "hc_unplayable_span",
+        "type": "playability",
+        "description": "Reject voicings that exceed reasonable hand span unless advanced mode is explicitly enabled.",
+        "left_hand_max_semitones": 12,
+        "right_hand_max_semitones": 11,
+        "severity": "high"
+      },
+      {
+        "id": "hc_low_register_mud_cluster",
+        "type": "register_density",
+        "description": "Avoid dense clusters in low register.",
+        "forbidden_if": {
+          "lowest_note_below_midi": 48,
+          "adjacent_interval_semitones_lte": 2,
+          "simultaneous_notes_gte": 3
+        },
+        "severity": "high"
+      },
+      {
+        "id": "hc_cross_hand_chaos",
+        "type": "hand_order",
+        "description": "Avoid right hand consistently placed below left hand top note unless intentionally marked as special texture.",
+        "severity": "medium_high"
+      },
+      {
+        "id": "hc_outside_chord_without_context",
+        "type": "harmonic_fit",
+        "description": "Non-chord tones that are not explainable as passing, neighbor, suspension, arpeggio color, or melody-support note should be heavily penalized.",
+        "severity": "high"
+      }
+    ]
+  },
+  "soft_constraints": {
+    "description": "Weighted preferences used for scoring among valid candidates.",
+    "rules": [
+      {
+        "id": "sc_stepwise_top_note",
+        "type": "top_note_motion",
+        "preferred_intervals_semitones": [0, 1, 2, -1, -2],
+        "acceptable_intervals_semitones": [3, 4, 5, -3, -4, -5],
+        "discouraged_intervals_semitones": [6, 7, 8, 9, 10, 11, 12, -6, -7, -8, -9, -10, -11, -12]
+      },
+      {
+        "id": "sc_common_tone_retention",
+        "type": "voice_leading",
+        "description": "Prefer retaining one or two common tones between adjacent chords when musically appropriate."
+      },
+      {
+        "id": "sc_inner_voice_min_motion",
+        "type": "voice_leading",
+        "description": "Prefer minimal motion in inner voices unless tension build is intended."
+      },
+      {
+        "id": "sc_stable_primary_label",
+        "type": "labeling_bias",
+        "description": "Prefer a musically stable, practical structural chord label over an overly literal pitch-set label when both are explainable.",
+        "examples": [
+          "Prefer Dm7 + surface 9 over forcing Dm9 as structural label in a simple arpeggio context",
+          "Prefer Fmaj9/A over Am7(b13) when F-centered context is stronger"
+        ]
+      }
+    ]
+  },
+  "analysis_context_rules": {
+    "arpeggio_sensitive_analysis": {
+      "description": "Short decorative notes in an arpeggio should not automatically redefine structural harmony.",
+      "rules": [
+        {
+          "id": "arp_structural_weighting",
+          "description": "Weight bass notes, long notes, metrically strong notes, and repeated tones more heavily than short traversal tones.",
+          "weight_bias": {
+            "bass_note": 1.4,
+            "long_duration": 1.25,
+            "strong_beat": 1.2,
+            "repeated_tone": 1.15,
+            "short_traversal_note": 0.65
+          }
+        },
+        {
+          "id": "arp_surface_extension_tagging",
+          "description": "If a color tone appears briefly in arpeggio context but the structural triad/seventh remains stable, tag it as surface extension instead of forcing a structural relabel.",
+          "examples": [
+            {
+              "input_pitch_set_context": "D-F-A with brief E in arpeggio",
+              "preferred_structural_label": "Dm7",
+              "surface_extension": "9"
+            }
+          ]
+        },
+        {
+          "id": "arp_no_hyper_relabeling",
+          "description": "Do not continuously relabel every decorative arpeggio tone as a new chord unless accent, duration, repetition, or bass support justifies it."
+        }
+      ]
+    },
+    "candidate_labeling_policy": {
+      "description": "Return a preferred label plus alternate candidates with score and explanation.",
+      "rules": [
+        {
+          "id": "cand_primary_plus_alternates",
+          "description": "Every ambiguous segment should provide at least one selected label and up to three alternate candidates when relevant."
+        },
+        {
+          "id": "cand_context_bias",
+          "description": "Bias candidate ranking by phrase context, surrounding harmony, bass placement, chord completeness, and practical readability."
+        }
+      ]
+    }
+  },
+  "chord_quality_rules": [
+    {
+      "id": "cq_maj7",
+      "chord_quality": "maj7",
+      "function_group": "tonic",
+      "chord_tones": ["1", "3", "5", "7"],
+      "priority_tones": [
+        {"degree": "3", "score": 1.0},
+        {"degree": "7", "score": 1.0},
+        {"degree": "1", "score": 0.8},
+        {"degree": "5", "score": 0.5}
+      ],
+      "available_tensions": [
+        {"degree": "9", "score": 0.8},
+        {"degree": "13", "score": 0.75},
+        {"degree": "#11", "score": 0.9, "context": "lydian"}
+      ],
+      "avoid_tones": [
+        {"degree": "11", "severity": "high", "reason": "minor ninth clash against major third on strong beat"}
+      ],
+      "preferred_bass_options": ["1", "3", "5"],
+      "allowed_inversions": [
+        {"bass_degree": "1", "score": 1.0},
+        {"bass_degree": "3", "score": 0.85},
+        {"bass_degree": "5", "score": 0.6},
+        {"bass_degree": "7", "score": 0.3}
+      ],
+      "top_note_preferences": [
+        {"degree": "3", "score": 0.95},
+        {"degree": "7", "score": 0.9},
+        {"degree": "9", "score": 0.85},
+        {"degree": "13", "score": 0.7}
+      ]
+    },
+    {
+      "id": "cq_m7",
+      "chord_quality": "m7",
+      "function_group": "predominant",
+      "chord_tones": ["1", "b3", "5", "b7"],
+      "priority_tones": [
+        {"degree": "b3", "score": 1.0},
+        {"degree": "b7", "score": 1.0},
+        {"degree": "1", "score": 0.8},
+        {"degree": "5", "score": 0.5}
+      ],
+      "available_tensions": [
+        {"degree": "9", "score": 0.85},
+        {"degree": "11", "score": 0.9},
+        {"degree": "13", "score": 0.7, "context": "dorian"},
+        {"degree": "b13", "score": 0.6, "context": "aeolian"}
+      ],
+      "avoid_tones": [],
+      "preferred_bass_options": ["1", "5", "b3"],
+      "allowed_inversions": [
+        {"bass_degree": "1", "score": 1.0},
+        {"bass_degree": "5", "score": 0.75},
+        {"bass_degree": "b3", "score": 0.65},
+        {"bass_degree": "b7", "score": 0.35}
+      ],
+      "top_note_preferences": [
+        {"degree": "b3", "score": 0.95},
+        {"degree": "11", "score": 0.9},
+        {"degree": "9", "score": 0.85},
+        {"degree": "b7", "score": 0.8}
+      ]
+    },
+    {
+      "id": "cq_dom7",
+      "chord_quality": "7",
+      "function_group": "dominant",
+      "chord_tones": ["1", "3", "5", "b7"],
+      "priority_tones": [
+        {"degree": "3", "score": 1.0},
+        {"degree": "b7", "score": 1.0},
+        {"degree": "1", "score": 0.7},
+        {"degree": "5", "score": 0.4}
+      ],
+      "available_tensions": [
+        {"degree": "9", "score": 0.75},
+        {"degree": "13", "score": 0.8},
+        {"degree": "b9", "score": 0.85, "context": "dominant_to_minor_or_alt"},
+        {"degree": "#9", "score": 0.8, "context": "altered"},
+        {"degree": "#11", "score": 0.75, "context": "lydian_dominant"},
+        {"degree": "b13", "score": 0.8, "context": "altered"}
+      ],
+      "avoid_tones": [
+        {"degree": "11", "severity": "high", "reason": "clashes against major third unless treated as sus"}
+      ],
+      "preferred_bass_options": ["1", "3", "b7"],
+      "allowed_inversions": [
+        {"bass_degree": "1", "score": 1.0},
+        {"bass_degree": "3", "score": 0.9},
+        {"bass_degree": "b7", "score": 0.7},
+        {"bass_degree": "5", "score": 0.35}
+      ],
+      "top_note_preferences": [
+        {"degree": "3", "score": 0.95},
+        {"degree": "b7", "score": 0.95},
+        {"degree": "b9", "score": 0.9},
+        {"degree": "13", "score": 0.8},
+        {"degree": "#9", "score": 0.8}
+      ]
+    },
+    {
+      "id": "cq_m7b5",
+      "chord_quality": "m7b5",
+      "function_group": "predominant_minor",
+      "chord_tones": ["1", "b3", "b5", "b7"],
+      "priority_tones": [
+        {"degree": "b3", "score": 1.0},
+        {"degree": "b5", "score": 0.95},
+        {"degree": "b7", "score": 0.95},
+        {"degree": "1", "score": 0.75}
+      ],
+      "available_tensions": [
+        {"degree": "11", "score": 0.9},
+        {"degree": "b13", "score": 0.75},
+        {"degree": "9", "score": 0.45, "context": "locrian"},
+        {"degree": "9", "score": 0.75, "context": "locrian_sharp2"}
+      ],
+      "avoid_tones": [],
+      "preferred_bass_options": ["1", "b5"],
+      "allowed_inversions": [
+        {"bass_degree": "1", "score": 1.0},
+        {"bass_degree": "b5", "score": 0.8},
+        {"bass_degree": "b3", "score": 0.45},
+        {"bass_degree": "b7", "score": 0.3}
+      ],
+      "top_note_preferences": [
+        {"degree": "11", "score": 0.9},
+        {"degree": "b3", "score": 0.85},
+        {"degree": "b5", "score": 0.8},
+        {"degree": "b7", "score": 0.8}
+      ]
+    },
+    {
+      "id": "cq_7alt",
+      "chord_quality": "7alt",
+      "function_group": "dominant_altered",
+      "chord_tones": ["1", "3", "b7"],
+      "priority_tones": [
+        {"degree": "3", "score": 1.0},
+        {"degree": "b7", "score": 1.0},
+        {"degree": "b9", "score": 0.9},
+        {"degree": "#9", "score": 0.85},
+        {"degree": "b13", "score": 0.85},
+        {"degree": "#11", "score": 0.75}
+      ],
+      "available_tensions": [
+        {"degree": "b9", "score": 0.95},
+        {"degree": "#9", "score": 0.9},
+        {"degree": "#11", "score": 0.8},
+        {"degree": "b13", "score": 0.9}
+      ],
+      "avoid_tones": [
+        {"degree": "5", "severity": "medium", "reason": "often omitted in altered dominant"},
+        {"degree": "11", "severity": "high", "reason": "avoid natural 11 in altered context"}
+      ],
+      "preferred_bass_options": ["1", "3"],
+      "allowed_inversions": [
+        {"bass_degree": "1", "score": 1.0},
+        {"bass_degree": "3", "score": 0.8},
+        {"bass_degree": "b7", "score": 0.55}
+      ],
+      "top_note_preferences": [
+        {"degree": "b9", "score": 0.95},
+        {"degree": "#9", "score": 0.9},
+        {"degree": "b13", "score": 0.88},
+        {"degree": "3", "score": 0.7}
+      ]
+    },
+    {
+      "id": "cq_7sus",
+      "chord_quality": "7sus",
+      "function_group": "dominant_suspended",
+      "chord_tones": ["1", "4", "5", "b7"],
+      "priority_tones": [
+        {"degree": "4", "score": 1.0},
+        {"degree": "b7", "score": 0.95},
+        {"degree": "1", "score": 0.8},
+        {"degree": "5", "score": 0.55}
+      ],
+      "available_tensions": [
+        {"degree": "9", "score": 0.9},
+        {"degree": "13", "score": 0.8}
+      ],
+      "avoid_tones": [
+        {"degree": "3", "severity": "medium", "reason": "do not sustain major 3rd against 4th unless resolving"}
+      ],
+      "preferred_bass_options": ["1", "5"],
+      "allowed_inversions": [
+        {"bass_degree": "1", "score": 1.0},
+        {"bass_degree": "5", "score": 0.75},
+        {"bass_degree": "b7", "score": 0.45}
+      ],
+      "top_note_preferences": [
+        {"degree": "4", "score": 0.95},
+        {"degree": "9", "score": 0.9},
+        {"degree": "13", "score": 0.75}
+      ]
+    }
+  ],
+  "voicing_templates": [
+    {
+      "id": "vt_shell_root",
+      "name": "shell_root_position",
+      "applies_to": ["maj7", "m7", "7", "m7b5", "7alt", "7sus"],
+      "hands": {
+        "left_hand": ["1", "7_or_b7"],
+        "right_hand": ["3_or_b3", "5_or_tension"]
+      },
+      "note_count_range": {"min": 3, "max": 4},
+      "register_profile": {
+        "left_hand_midi_range": [36, 55],
+        "right_hand_midi_range": [55, 79]
+      },
+      "playability_score": 0.95
+    },
+    {
+      "id": "vt_rootless_A",
+      "name": "rootless_A_type",
+      "applies_to": ["maj7", "m7", "7"],
+      "hands": {
+        "left_hand": ["3_or_b3", "7_or_b7"],
+        "right_hand": ["9_or_1", "5_or_13"]
+      },
+      "note_count_range": {"min": 4, "max": 4},
+      "register_profile": {
+        "left_hand_midi_range": [43, 60],
+        "right_hand_midi_range": [60, 81]
+      },
+      "playability_score": 0.9
+    },
+    {
+      "id": "vt_spread_ballad",
+      "name": "spread_ballad_voicing",
+      "applies_to": ["maj7", "m7", "7sus", "6", "69"],
+      "hands": {
+        "left_hand": ["1", "5"],
+        "right_hand": ["3_or_b3_or_4", "7_or_6_or_b7", "9_or_13"]
+      },
+      "note_count_range": {"min": 4, "max": 5},
+      "register_profile": {
+        "left_hand_midi_range": [33, 52],
+        "right_hand_midi_range": [57, 84]
+      },
+      "playability_score": 0.92
+    },
+    {
+      "id": "vt_alt_compact",
+      "name": "altered_dominant_compact",
+      "applies_to": ["7alt"],
+      "hands": {
+        "left_hand": ["1_or_3", "b7"],
+        "right_hand": ["b9_or_#9", "#11_or_b13"]
+      },
+      "note_count_range": {"min": 4, "max": 4},
+      "register_profile": {
+        "left_hand_midi_range": [38, 55],
+        "right_hand_midi_range": [60, 83]
+      },
+      "playability_score": 0.78
+    }
+  ],
+  "playability_constraints": {
+    "left_hand_max_semitones": 12,
+    "right_hand_max_semitones": 11,
+    "advanced_mode_left_hand_max": 14,
+    "advanced_mode_right_hand_max": 13,
+    "recommended_max_simultaneous_left_hand_notes": 2,
+    "max_simultaneous_left_hand_notes": 3,
+    "preferred_top_note_midi_range": [60, 84],
+    "hard_top_note_midi_range": [55, 88],
+    "cross_hand_avoid": true,
+    "low_register_interval_rules": [
+      {
+        "below_midi": 40,
+        "forbid_intervals": [1, 2, 3, 4, 5]
+      },
+      {
+        "below_midi": 48,
+        "forbid_dense_three_note_stack_within_semitones": 7
+      }
+    ]
+  },
+  "inversion_rules": [
+    {
+      "id": "inv_tonic_stability",
+      "applies_to_function": "tonic",
+      "preferred_inversions": [
+        {"bass_degree": "1", "score": 1.0},
+        {"bass_degree": "3", "score": 0.8},
+        {"bass_degree": "5", "score": 0.55},
+        {"bass_degree": "7", "score": 0.2}
+      ],
+      "notes": "Use root position most often for strong arrival; first inversion allowed for smoother bass line."
+    },
+    {
+      "id": "inv_predominant_flex",
+      "applies_to_function": "predominant",
+      "preferred_inversions": [
+        {"bass_degree": "1", "score": 0.95},
+        {"bass_degree": "5", "score": 0.75},
+        {"bass_degree": "b3", "score": 0.65},
+        {"bass_degree": "b7", "score": 0.35}
+      ],
+      "notes": "First and second inversion may be used to connect bass smoothly into dominant."
+    },
+    {
+      "id": "inv_dominant_resolution_bias",
+      "applies_to_function": "dominant",
+      "preferred_inversions": [
+        {"bass_degree": "1", "score": 1.0},
+        {"bass_degree": "3", "score": 0.9},
+        {"bass_degree": "b7", "score": 0.65},
+        {"bass_degree": "5", "score": 0.25}
+      ],
+      "notes": "Third in bass can strongly pull to tonic; fifth in bass is weak unless special line-cliche context."
+    }
+  ],
+  "progression_resolution_rules": [
+    {
+      "id": "pr_ii_V",
+      "progression": ["m7", "7"],
+      "guide_tone_rules": [
+        {"from_degree": "b3", "to_degree": "b7", "motion": "common_tone_preferred", "score": 0.95},
+        {"from_degree": "b7", "to_degree": "3", "motion": "down_semitone", "score": 1.0}
+      ],
+      "top_note_targets": [
+        {"strategy": "hold_common_tone_if_available", "score": 0.85},
+        {"strategy": "stepwise_motion", "score": 0.9}
+      ]
+    },
+    {
+      "id": "pr_V_I",
+      "progression": ["7", "maj7"],
+      "guide_tone_rules": [
+        {"from_degree": "3", "to_degree": "7", "motion": "common_tone_or_hold", "score": 0.85},
+        {"from_degree": "b7", "to_degree": "3", "motion": "down_semitone", "score": 1.0},
+        {"from_degree": "b9", "to_degree": "5_or_3", "motion": "down_semitone_or_step", "score": 0.9}
+      ],
+      "top_note_targets": [
+        {"strategy": "resolve_tension_downward", "score": 1.0},
+        {"strategy": "land_on_3_or_9", "score": 0.95}
+      ]
+    },
+    {
+      "id": "pr_iio_Valt_i",
+      "progression": ["m7b5", "7alt", "m7"],
+      "guide_tone_rules": [
+        {"from_degree": "b5", "to_degree": "3", "motion": "down_semitone_or_common_contextual", "score": 0.8},
+        {"from_degree": "b7", "to_degree": "3", "motion": "down_semitone", "score": 0.95},
+        {"from_degree": "b9", "to_degree": "5_or_b3", "motion": "down_semitone", "score": 0.9}
+      ]
+    },
+    {
+      "id": "pr_backdoor",
+      "progression": ["m7", "bVII7", "maj7"],
+      "top_note_targets": [
+        {"strategy": "smooth_descending_line", "score": 0.85},
+        {"strategy": "favor_color_tones_9_13_on_tonic", "score": 0.8}
+      ]
+    }
+  ],
+  "melody_alignment_rules": {
+    "description": "Melody-aware accompaniment and top-note handling.",
+    "rules": [
+      {
+        "id": "mar_follow_melody_support",
+        "mode": "follow_melody",
+        "description": "Top note may double melody when accompaniment is supportive and texture is sparse or medium.",
+        "top_note_relation_to_melody": [
+          {"interval_semitones": 0, "score": 1.0},
+          {"interval_semitones": -12, "score": 0.85},
+          {"interval_semitones": -3, "score": 0.6, "context": "parallel_harmony"},
+          {"interval_semitones": -4, "score": 0.6, "context": "parallel_harmony"}
+        ]
+      },
+      {
+        "id": "mar_avoid_minor9_clash",
+        "mode": "protect_melody",
+        "description": "Avoid top note creating harsh minor ninth clash against melody on strong beats.",
+        "forbidden_intervals_against_melody_on_strong_beat": [1, 13, -1, -13],
+        "penalty_if_exceeded": 1.0
+      },
+      {
+        "id": "mar_prefer_chord_tone_under_nonchord_melody",
+        "mode": "support_melody",
+        "description": "If melody note is a passing tone / neighbor / suspension, accompaniment top note should prefer stable chord tone.",
+        "if_melody_role": ["passing_tone", "neighbor_tone", "suspension"],
+        "preferred_top_note_degrees": ["3", "7", "1", "5"],
+        "score_boost": 0.25
+      },
+      {
+        "id": "mar_counter_motion",
+        "mode": "counter_line",
+        "description": "Prefer gentle contrary or oblique motion against melody in lyrical accompaniment.",
+        "preferred_motion_relative_to_melody": ["contrary", "oblique"],
+        "acceptable_motion_relative_to_melody": ["similar_stepwise"],
+        "discouraged_motion_relative_to_melody": ["similar_large_leap"]
+      }
+    ]
+  },
+  "top_note_modes": [
+    {
+      "id": "tnm_lyrical",
+      "mode_name": "lyrical",
+      "preferred_targets_by_function": {
+        "tonic": ["3", "7", "9"],
+        "predominant": ["11", "b3", "9"],
+        "dominant": ["b9", "3", "b7", "13"]
+      },
+      "motion_bias": "stepwise",
+      "leap_penalty": 0.7
+    },
+    {
+      "id": "tnm_stable",
+      "mode_name": "stable",
+      "preferred_targets_by_function": {
+        "tonic": ["3", "7", "5"],
+        "predominant": ["b3", "b7", "11"],
+        "dominant": ["3", "b7", "13"]
+      },
+      "motion_bias": "common_tone_or_stepwise",
+      "leap_penalty": 0.8
+    },
+    {
+      "id": "tnm_tension_peak",
+      "mode_name": "tension_peak",
+      "preferred_targets_by_function": {
+        "tonic": ["9", "7"],
+        "predominant": ["11", "9"],
+        "dominant": ["b9", "#9", "b13", "#11"]
+      },
+      "motion_bias": "controlled_contrast",
+      "leap_penalty": 0.5
+    }
+  ],
+  "candidate_interpretation_examples": [
+    {
+      "id": "ex_dm7_vs_dm9_arpeggio",
+      "description": "In arpeggio context, a brief E over D-F-A should not automatically force structural Dm9.",
+      "input_context": {
+        "structural_pitch_center": ["D", "F", "A", "C"],
+        "surface_note": "E",
+        "texture": "arpeggio"
+      },
+      "preferred_output": {
+        "structural_chord": "Dm7",
+        "surface_extensions": ["9"],
+        "alternate_candidate": "Dm9",
+        "reason": "Surface color note present, but structural label should remain stable in simple accompaniment arpeggio unless E is metrically or durationally emphasized."
+      }
+    },
+    {
+      "id": "ex_fmaj9_over_a_vs_am7b13",
+      "description": "Same pitch collection may admit multiple labels. Prefer the more complete/contextually stable label.",
+      "input_pitch_collection": ["F", "A", "C", "E", "G"],
+      "candidate_chords": [
+        {
+          "label": "Fmaj9/A",
+          "score_bias": 0.91,
+          "reasons": [
+            "Complete Fmaj9 pitch collection present",
+            "Slash chord over A is common and readable",
+            "Phrase context may favor F-centered interpretation"
+          ]
+        },
+        {
+          "label": "Am7(b13)",
+          "score_bias": 0.74,
+          "reasons": [
+            "A-C-E-G present and F can function as b13",
+            "Valid alternate interpretation",
+            "Less preferred as primary label if surrounding harmony suggests F-major center"
+          ]
+        }
+      ],
+      "selected_label_policy": "Return both, choose one with higher context-weighted score."
+    }
+  ],
+  "analysis_pipeline": {
+    "goal": "Analyze MIDI using rule DB and return chord identification, inversion analysis, melody/top-note fit, playability, voice-leading quality, and rule compliance.",
+    "steps": [
+      "Parse MIDI note events, tempo, time signature, tracks.",
+      "Split into analysis windows (bar, half-bar, beat, or event-based).",
+      "Estimate melody track or melody note if melody track is provided.",
+      "Estimate bass, top note, and left/right hand distribution.",
+      "Generate chord candidates per window.",
+      "Score candidates using structural weighting, chord completeness, bass fit, context, melody relation, and rule DB.",
+      "Select primary chord plus alternate candidates.",
+      "Evaluate voicing, inversion, top note, voice leading, tension validity, avoid tones, and playability.",
+      "Return overall report with bar/segment diagnostics and suggestions."
+    ]
+  },
+  "scoring_model": {
+    "description": "Suggested weighted score components for each candidate and final report.",
+    "components": [
+      {"name": "harmonic_fit", "weight": 0.28},
+      {"name": "structural_label_stability", "weight": 0.12},
+      {"name": "melody_support", "weight": 0.18},
+      {"name": "playability", "weight": 0.14},
+      {"name": "voice_leading", "weight": 0.14},
+      {"name": "inversion_suitability", "weight": 0.07},
+      {"name": "contextual_progression_fit", "weight": 0.07}
+    ],
+    "notes": [
+      "Hard-constraint violations should reject a candidate or apply a near-fatal penalty.",
+      "Soft constraints should rank otherwise valid candidates.",
+      "Structural label stability should favor musically readable labels over overfitted pitch-set labels."
+    ]
+  },
+  "input_schema": {
+    "midi_file": "required",
+    "melody_track_index": "optional but strongly recommended",
+    "analysis_window_mode": ["bar", "half_bar", "beat", "event_based"],
+    "style_hint": ["ballad", "jazz", "pop_jazz", "modern_jazz"],
+    "top_note_mode": ["lyrical", "stable", "tension_peak"],
+    "advanced_playability_mode": [true, false]
+  },
+  "output_schema": {
+    "file_id": "string",
+    "estimated_key_center": "string_or_null",
+    "overall_scores": {
+      "harmonic_fit": "0_to_1",
+      "melody_support": "0_to_1",
+      "playability": "0_to_1",
+      "voice_leading": "0_to_1",
+      "overall": "0_to_1"
+    },
+    "segments": [
+      {
+        "segment_index": "integer",
+        "range_ticks": ["start", "end"],
+        "selected_label": "string",
+        "alternate_candidates": [
+          {
+            "label": "string",
+            "score": "0_to_1",
+            "reasons": ["string"]
+          }
+        ],
+        "structural_chord": "string",
+        "surface_extensions": ["string"],
+        "estimated_inversion": "string_or_null",
+        "detected_top_note": "string_or_null",
+        "melody_note": "string_or_null",
+        "scores": {
+          "harmonic_fit": "0_to_1",
+          "melody_support": "0_to_1",
+          "playability": "0_to_1",
+          "voice_leading": "0_to_1"
+        },
+        "issues": [
+          {
+            "type": "string",
+            "severity": "low_medium_high",
+            "description": "string"
+          }
+        ],
+        "suggestions": [
+          {
+            "action": "string",
+            "reason": "string"
+          }
+        ]
+      }
+    ]
+  },
+  "developer_notes": [
+    "Start with a rule-based analyzer first; add ML/AI later as a contextual assistant, not as the only judge.",
+    "Treat melody as top-priority when melody track exists.",
+    "Return primary and alternate chord labels rather than pretending ambiguity does not exist.",
+    "Separate structural harmony and surface-note interpretation in both internals and output.",
+    "For accompaniment analysis, avoid overreacting to every passing/arpeggiated color tone.",
+    "This JSON is intended as a starting spec; weights should be tuned empirically on real MIDI examples."
+  ]
+}
