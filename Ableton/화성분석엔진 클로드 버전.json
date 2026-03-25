@@ -1,0 +1,3137 @@
+{
+  "schema_version": 1.8,
+  "project_name": "MIDI Harmony Analyzer Rule DB",
+  "purpose": "Rule database and analysis philosophy for a piano accompaniment harmony analyzer that evaluates MIDI against jazz/pop accompaniment rules while remaining sensitive to arpeggio context, melody support, inversion logic, playability, and voice leading. Extended with enharmonic handling, generalized secondary-dominant logic, style-aware voicing decisions, and melody-constrained voicing selection. Further refined with bass-priority root selection and structural promotion of sustained/accented 7th/9th tones Added humanized-timing tolerance for non-quantized performance MIDI so slight anticipations, overlaps, and delayed releases near beat/bar boundaries are not over-read as immediate harmonic changes Also distinguishes real note-length occupancy from pedal-like overlap, treats melodic/arpeggiated bass motion cautiously, and enforces bass-aware final labeling so upper-structure sonorities never erase the actual sounding bass. Further refined with contextual incomplete-voicing handling so shell voicings, omitted tones, and partial right-hand fragments are not falsely rejected; added observed-pitch-set integrity checks so functional labels cannot ignore clearly sounding tones; and formalized separation between literal pitch-set / upper-structure detection / final bass-aware functional labeling. Extended with meter-verification logic that cross-checks MIDI metadata time signatures against actual onset-pattern grouping, bass accent cycles, velocity profiles, and subdivision regularity, so that incorrectly exported meters (e.g. 6/8 exported as 4/4) are detected and corrected before harmonic segmentation begins.",
+  "design_philosophy": {
+    "summary": [
+      "Do not label harmony only by collecting all sounding pitches equally.",
+      "Separate structural harmony from surface notes.",
+      "In arpeggio/accompaniment contexts, short decorative notes should not automatically force richer chord labels.",
+      "Prefer stable, musically practical chord labels over overly literal pitch-set labels.",
+      "Return a primary label plus alternate candidates with confidence and reasons.",
+      "Melody has higher priority than accompaniment top-note freedom.",
+      "Reject or penalize voicings that are physically impractical or aesthetically muddy on piano.",
+      "Treat rules as weighted preferences, not absolute truth, except for hard constraints.",
+      "Because MIDI stores pitch classes without true enharmonic spelling, do not over-penalize or mislabel harmony solely due to spelling ambiguity such as E# vs F or Cb vs B; resolve naming by harmonic context.",
+      "When a dominant-resolution path is strongly supported, a single ambiguous chromatic note should not automatically overturn an otherwise well-supported structural chord.",
+      "Do not assume every non-diatonic chord is a secondary dominant; evaluate borrowed color, modal interchange, chromatic planing, suspensions, passing diminished, pedal harmony, and tritone-sub behavior before forcing a dominant-function label.",
+      "Roman-numeral understanding should be derived from estimated key center plus local tonicization, then exposed separately from the literal chord label.",
+      "When the same pitch collection supports multiple labels, prioritize the label whose root is directly supported by the actual bass note before choosing a rootless or alternate-root interpretation.",
+      "When the sounding bass and observed tones already form a clear same-root shell such as m7, maj7, or dominant7, prefer that direct same-root family before promoting an alternate upper-structure-derived label.",
+      "If the 7th or 9th is metrically strong and sustained long enough to sound structural, promote it from surface color to the structural chord label rather than collapsing everything to a plain triad.",
+      "Do not output a root label that contradicts the sounding bass without explicitly marking the inversion/slash relationship.",
+      "In non-quantized performance MIDI, slight anticipations, overlaps, and delayed releases near beat or bar boundaries should be treated cautiously before declaring a structural chord change.",
+      "Distinguish expressive performance timing from structural harmonic timing; a newly appearing note near a boundary must earn structural status through beat strength, duration, repetition, bass support, or confirmation in the next segment.",
+      "When note length itself is explicitly encoded in performance MIDI, long-duration notes and sustained bass occupancy should be treated as stronger structural evidence than brief arrivals.",
+      "Do not mistake arpeggio traversal, melodic passing motion, or bass-line movement for an automatic harmonic relabel unless the new root also gains structural duration, supporting tones, and metrical confirmation.",
+      "Upper-structure recognition and final chord labeling are separate stages: even if the upper notes resemble a diminished or tension-heavy sonority, the selected label must remain bass-aware and must not erase the actual sounding bass.",
+      "Do not treat incomplete voicings as automatic analysis failure; recover likely function from bass, surrounding context, and resolution behavior when the observed voicing is a realistic shell or omission pattern.",
+      "However, do not invent absent tones carelessly when the actually sounding pitch-set already strongly points to another local sonority; missing-tone recovery is contextual support, not a license to ignore real notes.",
+      "Keep three views distinct when useful: literal sounding set, upper-structure/partial-voicing interpretation, and final bass-aware selected label.",
+      "Do not let bass-melody protection become so strong that it erases a genuine within-bar harmonic split supported by new bass duration and upper-structure reorganization.",
+      "Do not blindly trust the MIDI file's time-signature metadata. Many DAWs export 6/8, 3/4, 5/4, or other meters as 4/4 by default. Before committing to the metadata time signature, verify it against actual note-onset grouping patterns, bass accent cycles, and rhythmic periodicity in the performed MIDI data.",
+      "When the detected onset-grouping pattern conflicts with the MIDI metadata time signature, prefer the pattern-derived meter for harmonic segmentation and report the discrepancy explicitly."
+    ],
+    "analysis_layers": [
+      {
+        "layer": "structural_harmony",
+        "description": "The main chord identity for the segment/bar/beat.",
+        "examples": [
+          "Dm7",
+          "Fmaj7/A",
+          "Bb",
+          "G7"
+        ]
+      },
+      {
+        "layer": "surface_notes",
+        "description": "Passing tones, arpeggio traversal notes, decorative extensions, neighbor tones, suspensions, and melody-driven color notes that do not necessarily redefine the structural chord.",
+        "examples": [
+          "E as 9 over Dm7 in an arpeggio",
+          "F as b13 over Am7 candidate but not primary label"
+        ]
+      },
+      {
+        "layer": "contextual_interpretation",
+        "description": "Phrase context, surrounding chords, bass motion, inversion preference, melody relation, and accompaniment style determine the final preferred label."
+      }
+    ],
+    "priority_order": [
+      "melody_protection",
+      "bass_root_alignment",
+      "structural_extension_promotion",
+      "meter_verification",
+      "humanized_timing_tolerance",
+      "duration_occupancy",
+      "observed_pitch_set_integrity",
+      "chord_conformity",
+      "human_playability",
+      "voice_leading",
+      "functional_resolution",
+      "roman_numeral_clarity",
+      "non_diatonic_option_breadth",
+      "style_consistency",
+      "surface_color_interpretation"
+    ]
+  },
+  "hard_constraints": {
+    "description": "Violations here should reject candidates or heavily penalize them.",
+    "rules": [
+      {
+        "id": "hc_melody_minor9_strong_beat",
+        "type": "melody_clash",
+        "description": "Avoid harsh minor ninth / major seventh clashes between melody and accompaniment top note on strong beats.",
+        "forbidden_intervals_semitones": [
+          1,
+          -1,
+          11,
+          -11,
+          13,
+          -13
+        ],
+        "severity": "high"
+      },
+      {
+        "id": "hc_unplayable_span",
+        "type": "playability",
+        "description": "Reject voicings that exceed reasonable hand span unless advanced mode is explicitly enabled.",
+        "left_hand_max_semitones": 12,
+        "right_hand_max_semitones": 11,
+        "severity": "high"
+      },
+      {
+        "id": "hc_low_register_mud_cluster",
+        "type": "register_density",
+        "description": "Avoid dense clusters in low register.",
+        "forbidden_if": {
+          "lowest_note_below_midi": 48,
+          "adjacent_interval_semitones_lte": 2,
+          "simultaneous_notes_gte": 3
+        },
+        "severity": "high"
+      },
+      {
+        "id": "hc_cross_hand_chaos",
+        "type": "hand_order",
+        "description": "Avoid right hand consistently placed below left hand top note unless intentionally marked as special texture.",
+        "severity": "medium_high"
+      },
+      {
+        "id": "hc_outside_chord_without_context",
+        "type": "harmonic_fit",
+        "description": "Non-chord tones that are not explainable as passing, neighbor, suspension, arpeggio color, or melody-support note should be heavily penalized.",
+        "severity": "high"
+      },
+      {
+        "id": "hc_no_generic_dominant_catchall_final_label",
+        "type": "final_label_policy",
+        "description": "Final chord labels must not use a catch-all dominant label in place of explicitly supported dominant tensions. Write supported dominant tensions directly in the final label when structurally justified, and do not promote weak ornamental tones into final tension text.",
+        "severity": "high"
+      },
+      {
+        "id": "hc_no_identity_erasing_simplification",
+        "type": "final_label_policy",
+        "severity": "high",
+        "description": "Do not choose a cleaner or more familiar final label if doing so erases the chord's heard identity. Labels must not simplify away structurally meaningful bass notes, slash/inversion information, dominant-defining tensions, or a locally independent sonority that is musically supported."
+      }
+    ]
+  },
+  "soft_constraints": {
+    "description": "Weighted preferences used for scoring among valid candidates.",
+    "rules": [
+      {
+        "id": "sc_stepwise_top_note",
+        "type": "top_note_motion",
+        "preferred_intervals_semitones": [
+          0,
+          1,
+          2,
+          -1,
+          -2
+        ],
+        "acceptable_intervals_semitones": [
+          3,
+          4,
+          5,
+          -3,
+          -4,
+          -5
+        ],
+        "discouraged_intervals_semitones": [
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          -6,
+          -7,
+          -8,
+          -9,
+          -10,
+          -11,
+          -12
+        ]
+      },
+      {
+        "id": "sc_common_tone_retention",
+        "type": "voice_leading",
+        "description": "Prefer retaining one or two common tones between adjacent chords when musically appropriate."
+      },
+      {
+        "id": "sc_inner_voice_min_motion",
+        "type": "voice_leading",
+        "description": "Prefer minimal motion in inner voices unless tension build is intended."
+      },
+      {
+        "id": "sc_stable_primary_label",
+        "type": "labeling_bias",
+        "description": "Prefer a musically stable, practical structural chord label over an overly literal pitch-set label only when the simplification preserves the actual harmonic identity. Practical readability may remove surface decoration, but it must not erase bass reality, structurally supported tensions, slash-chord information, or an independently interpretable local sonority.",
+        "examples": [
+          "Prefer Dm7 + surface 9 over forcing Dm9 as structural label in a simple arpeggio context",
+          "Prefer Fmaj9/A over Am7(b13) when F-centered context is stronger",
+          "Do not reduce E7(b9) to E7 when the b9 is structurally salient",
+          "Do not collapse C7/Bb into plain C or C7 if the Bb bass is structurally meaningful"
+        ]
+      },
+      {
+        "id": "sc_practical_label_preserve_identity",
+        "type": "labeling_guardrail",
+        "description": "A practical final label may be simpler than the full surface pitch collection, but it must preserve the harmonic identity that is actually heard. Do not simplify away structurally meaningful bass placement, slash information, dominant-defining tensions, or a convincingly independent local sonority merely to produce a cleaner label."
+      },
+      {
+        "id": "sc_surface_detail_may_be_omitted_but_identity_may_not",
+        "type": "label_simplification_boundary",
+        "description": "Surface decoration may be omitted from the final label when it is brief, ornamental, or non-structural. Harmonic-identity cues must not be omitted. Treat decorative passing tones, ornamental anticipations, and fleeting arpeggio traversal notes as removable surface detail, but preserve actual bass support, structurally supported tensions, chord quality, inversion/slash information, and independently interpretable local harmonic changes."
+      },
+      {
+        "id": "sc_bass_supported_root_preference",
+        "type": "root_selection",
+        "description": "Prefer structural labels whose root is directly supported by the sounding bass note on strong beats. If an alternate-root interpretation is still useful, present it as a slash/inversion candidate rather than the main unslashed label."
+      },
+      {
+        "id": "sc_structural_extension_promotion",
+        "type": "extension_promotion",
+        "description": "Reward chord labels that explicitly include a 7th or 9th when that extension is metrically strong and durationally salient enough to sound structural rather than merely decorative."
+      },
+      {
+        "id": "sc_humanized_boundary_tolerance",
+        "type": "timing_interpretation",
+        "description": "In non-quantized performance MIDI, prefer explanations that treat slight anticipations, overlaps, or delayed releases near beat/bar boundaries as expressive timing unless a new harmony gains sufficient structural support."
+      },
+      {
+        "id": "sc_duration_occupancy",
+        "type": "temporal_weighting",
+        "description": "Prefer labels supported by notes that occupy meaningful duration in the segment, especially when the bass and chord skeleton remain present longer than brief decorative or anticipatory notes."
+      },
+      {
+        "id": "sc_bass_motion_filter",
+        "type": "bass_interpretation",
+        "description": "Prefer analyses that treat brief scalar, chromatic, or arpeggiated bass movement as melodic bass motion before promoting it to a new chord root."
+      },
+      {
+        "id": "sc_contextual_incomplete_voicing_recovery",
+        "type": "contextual_recovery",
+        "description": "Treat incomplete voicings, shell voicings, omitted 5ths, and partial right-hand fragments as valid real-world evidence. Do not hard-reject a candidate only because root/3rd/7th are not all present if bass support, surrounding harmony, and resolution behavior strongly recover the function."
+      },
+      {
+        "id": "sc_observed_pitch_set_integrity",
+        "type": "literal_vs_function_balance",
+        "description": "Reward candidates that remain faithful to clearly sounding structural tones. Functional reinterpretation may fill in likely omitted tones, but it must not casually ignore strong, sustained, or metrically important observed tones that point to another local sonority."
+      },
+      {
+        "id": "sc_upper_structure_then_bass_aware_final_label",
+        "type": "labeling_pipeline",
+        "description": "When upper notes suggest an independent sonority such as a diminished seventh or tension-heavy structure, analyze that upper structure first, then convert to a final label that still reflects the actual bass and broader context."
+      }
+    ]
+  },
+  "analysis_context_rules": {
+    "arpeggio_sensitive_analysis": {
+      "description": "Short decorative notes in an arpeggio should not automatically redefine structural harmony.",
+      "rules": [
+        {
+          "id": "arp_structural_weighting",
+          "description": "Weight bass notes, long notes, metrically strong notes, and repeated tones more heavily than short traversal tones.",
+          "weight_bias": {
+            "bass_note": 1.4,
+            "long_duration": 1.25,
+            "strong_beat": 1.2,
+            "repeated_tone": 1.15,
+            "short_traversal_note": 0.65
+          }
+        },
+        {
+          "id": "arp_surface_extension_tagging",
+          "description": "If a color tone appears briefly in arpeggio context but the structural triad/seventh remains stable, tag it as surface extension instead of forcing a structural relabel.",
+          "examples": [
+            {
+              "input_pitch_set_context": "D-F-A with brief E in arpeggio",
+              "preferred_structural_label": "Dm7",
+              "surface_extension": "9"
+            }
+          ]
+        },
+        {
+          "id": "arp_no_hyper_relabeling",
+          "description": "Do not continuously relabel every decorative arpeggio tone as a new chord unless accent, duration, repetition, or bass support justifies it."
+        },
+        {
+          "id": "arp_dominant_context_protection",
+          "description": "When the previous harmony clearly functions as a dominant toward the current target, brief non-structural chromatic notes in the target chord should be treated as surface decoration before considering a structural relabel."
+        },
+        {
+          "id": "arp_sustained_extension_exception",
+          "description": "The arpeggio simplification rule applies to brief traversal notes only. If a 7th or other extension is sustained on a strong beat, do not demote that specific extension to surface color automatically. Evaluate each extension independently for structural promotion."
+        },
+        {
+          "id": "arp_bass_and_melody_motion_not_auto_relabel",
+          "description": "In humanized accompaniment MIDI, arpeggiated upper notes, melodic passing notes, and brief bass traversal notes should first be interpreted as motion within the current harmony. Do not promote them to a new chord unless they also gain structural duration, supporting chord tones, and metric confirmation."
+        }
+      ]
+    },
+    "humanized_timing_tolerance": {
+      "description": "Rules for separating expressive microtiming in human-played MIDI from true harmonic change points.",
+      "rules": [
+        {
+          "id": "hum_boundary_onset_caution",
+          "description": "In non-quantized performance MIDI, a note that enters slightly before or after a beat/bar boundary should not by itself trigger an immediate structural chord relabel.",
+          "default_interpretation_order": [
+            "anticipation",
+            "overlap",
+            "pickup",
+            "delayed_release",
+            "expressive_human_timing",
+            "true_harmonic_change"
+          ]
+        },
+        {
+          "id": "hum_require_structural_confirmation",
+          "description": "Promote a boundary-adjacent note or note-group to a new structural harmony only if the new sonority gains independent support through beat strength, duration, repetition, bass confirmation, or re-articulation in the following slice.",
+          "promotion_evidence": [
+            "strong_beat_confirmation",
+            "durational_salience",
+            "bass_motion_support",
+            "multiple_structural_tones_rearticulated",
+            "next_window_confirmation"
+          ],
+          "demotion_if_only": [
+            "single_early_pickup_note",
+            "late_arriving_inner_voice",
+            "brief_overlap_from_next_chord",
+            "humanized_microtiming_without_bass_change"
+          ]
+        },
+        {
+          "id": "hum_bass_change_needs_weight",
+          "description": "A newly appearing bass note near the end of a segment should not automatically replace the current structural bass unless it occupies enough of the segment or is confirmed at the next metrically meaningful point.",
+          "preferred_actions": [
+            "keep_current_structural_label",
+            "tag_new_note_as_pickup_or_anticipation",
+            "store_alternate_candidate_for_next_segment"
+          ]
+        },
+        {
+          "id": "hum_overlap_resolution_bias",
+          "description": "If the existing chord skeleton remains dominant in duration and metrical weight while one or two notes from the next chord appear early, prefer the existing structural label and treat the incoming notes as overlap/anticipation.",
+          "examples": [
+            {
+              "input_context": "A-C-Eb occupies most of the bar, B enters only at the very end in humanized timing",
+              "preferred_structural_label": "A°/C",
+              "surface_or_transition_tag": "B as anticipation of next harmony",
+              "alternate_candidate": "B7(b9)",
+              "reason": "Late boundary-adjacent B does not independently earn structural control of the current bar."
+            },
+            {
+              "input_context": "Current chord remains present, next-chord note arrives slightly early before the barline",
+              "preferred_action": "Do not relabel immediately; wait for next-slice confirmation unless bass and multiple structural tones also shift."
+            }
+          ]
+        },
+        {
+          "id": "hum_allow_true_midbar_split_when_harmony_reorganizes",
+          "description": "In human-played accompaniment MIDI, do not assume one bar equals one harmony. If a new bass arrival is accompanied by a meaningful reorganization of the upper structure, allow a true mid-bar chord split even when note endings overlap or the timing is slightly early/late.",
+          "promotion_evidence": [
+            "new_bass_establishes_local_weight",
+            "upper_structure_reorganized_around_new_bass",
+            "previous_chord_identity_weakens_or_releases",
+            "new_sonority_has_independent_harmonic_identity",
+            "local_resolution_or_next_chord_confirms_the_arrival"
+          ],
+          "demotion_if_only": [
+            "single_anticipation_tone",
+            "brief_overlap_without_upper_structure_shift",
+            "bass_pickup_without_new_harmonic_support",
+            "ornamental_rearticulation_of_existing_chord"
+          ]
+        },
+        {
+          "id": "hum_split_preferred_over_single_bar_merge_when_two_harmonic_centers_are_audible",
+          "description": "When one part of the bar is still colored by the previous chord but a later portion establishes a second clear harmonic center, prefer representing two local chord events rather than forcing the entire bar into one merged label. Residual sustain from the earlier chord should be treated as overlap if the later sonority becomes independently convincing.",
+          "preferred_actions": [
+            "emit_primary_midbar_split",
+            "preserve_overlap_as_surface_or_transition_context",
+            "keep_both_local_harmonic_centers_visible_in_analysis"
+          ],
+          "examples": [
+            {
+              "input_context": "Early in the bar: E bass with G#-D-F-B. Later in the same bar: Bb bass with C-E-G, followed by Am11 in the next arrival.",
+              "preferred_analysis": "E7(b9) -> C7/Bb within the bar, then Am11",
+              "reason": "The later Bb-based sonority is not just bass melody; it forms an independently audible second harmonic center before the next chord."
+            }
+          ]
+        },
+        {
+          "id": "hum_duration_occupancy_priority",
+          "description": "When performance MIDI uses actual note lengths instead of pedal automation, privilege duration occupancy. A note or bass movement that is brief relative to the ongoing sonority should normally remain a surface, overlap, or melodic-motion event unless it captures substantial time and structural support.",
+          "preferred_evidence_order": [
+            "bass_duration_occupancy",
+            "chord_skeleton_duration",
+            "strong_beat_confirmation",
+            "rearticulation",
+            "next_window_confirmation"
+          ],
+          "demotion_targets": [
+            "brief_bass_passing_motion",
+            "arpeggio_inner_note",
+            "melodic_upper_neighbor",
+            "late_boundary_note_without_support"
+          ]
+        }
+      ]
+    },
+    "candidate_labeling_policy": {
+      "description": "Return a preferred label plus alternate candidates with score and explanation.",
+      "rules": [
+        {
+          "id": "cand_primary_plus_alternates",
+          "description": "Every ambiguous segment should provide at least one selected label and up to three alternate candidates when relevant."
+        },
+        {
+          "id": "cand_context_bias",
+          "description": "Bias candidate ranking by phrase context, surrounding harmony, bass placement, chord completeness, and practical readability."
+        },
+        {
+          "id": "cand_functional_resolution_bias",
+          "description": "If a candidate strongly explains the surrounding dominant-to-target resolution, boost it above alternatives that only match the raw pitch-set literally."
+        },
+        {
+          "id": "cand_no_false_unslashed_root",
+          "description": "If a chosen interpretation depends on a different bass than the sounding bass, output the inversion/slash explicitly. Never output an unslashed root label that contradicts the actual bass support."
+        },
+        {
+          "id": "cand_bass_priority_over_functional_prettiness",
+          "description": "Do not prefer a functionally elegant analysis over a bass-supported local sonority unless the evidence for the functional reinterpretation is clearly stronger and explicitly documented as an alternate."
+        },
+        {
+          "id": "cand_same_root_shell_first",
+          "description": "If the sounding bass plus observed structural tones already form a convincing same-root shell such as 1-b3-5-b7, 1-3-5-7, or 1-3-5-b7, prefer that same-root chord family as the primary candidate before promoting an alternate upper-structure-derived reading. Treat other apparent upper-structure chord shapes as alternate explanations unless they preserve the heard identity better than the same-root reading.",
+          "examples": [
+            {
+              "input_context": "Bass Bb with observed Db-F-Ab and additional color tone G",
+              "preferred_primary_label": "Bbm7-family first",
+              "alternate_interpretation": "upper-structure-derived reading may be stored as alternate only",
+              "reason": "The same-root minor-7 shell is already clearly established before considering alternate upper-structure names."
+            }
+          ]
+        },
+        {
+          "id": "cand_no_boundary_hyper_relabeling",
+          "description": "Do not relabel a segment solely because a few notes from the next harmony enter slightly early or a few notes from the current harmony release slightly late in non-quantized MIDI. Require structural confirmation before declaring a new primary label."
+        },
+        {
+          "id": "cand_bassless_unslashed_label_forbidden",
+          "description": "If the selected harmonic interpretation relies on an upper-structure root that is not the sounding bass, do not output the bare unslashed label. Emit a bass-aware slash form or a functionally reinterpreted bass-aware label instead."
+        },
+        {
+          "id": "cand_bass_motion_before_relabel",
+          "description": "Before promoting a newly heard bass pitch to a new chord root, test whether it is better explained as melodic bass motion, passing bass, line cliché, or arpeggiated traversal inside the current harmony."
+        },
+        {
+          "id": "cand_explicit_dominant_tension_labeling",
+          "description": "Do not collapse dominant sonorities into a generic catch-all label. When a dominant sonority is clearly supported, write the actually supported tensions explicitly, such as 7(b9), 7(#9), 7(b13), 7(#11), or supported combinations like 7(b9,b13). Include only tensions that are structurally supported and musically meaningful in the sonority."
+        },
+        {
+          "id": "cand_practical_readability_without_identity_loss",
+          "description": "Prefer readable final labels, but never at the cost of harmonic identity. Surface simplification is allowed only when the omitted material is genuinely decorative; if the bass, inversion, chord quality, or structurally supported tensions materially change what the sonority is, keep that information in the selected label."
+        },
+        {
+          "id": "cand_incomplete_voicing_not_auto_forbidden",
+          "description": "Do not forbid a functional label solely because one or more core tones are omitted in the local slice. First test whether the observed voicing is a plausible shell/incomplete voicing supported by bass, neighboring segments, and expected resolution."
+        },
+        {
+          "id": "cand_missing_tone_recovery_is_penalty_not_ban",
+          "description": "Missing core tones create uncertainty and should reduce confidence, not trigger an automatic ban. Escalate to alternate-candidate status only when contextual recovery is weak."
+        },
+        {
+          "id": "cand_observed_tone_conflict_guardrail",
+          "description": "Contextual recovery of omitted tones is allowed, but do not choose a final label that conflicts with clearly sounding structural tones unless the conflict is explicitly documented and strongly justified as an alternate interpretation."
+        },
+        {
+          "id": "cand_literal_upper_structure_function_split",
+          "description": "If needed, keep literal pitch-set, upper-structure label, and final functional label separate instead of collapsing everything into one forced name."
+        }
+      ]
+    },
+    "root_and_extension_resolution": {
+      "description": "Rules for deciding between competing root interpretations and for promoting sustained chord tones into the structural label.",
+      "rules": [
+        {
+          "id": "root_rule_a_bass_priority",
+          "description": "When the same pitch collection supports multiple chord names, prefer the label whose root is explicitly supported by the sounding bass note, especially on strong beats. Do not choose an alternate-root label unless the inversion/slash form is written explicitly.",
+          "examples": [
+            {
+              "input_pitch_set": "D-F#-A-B with bass D",
+              "preferred_label": "D6",
+              "alternate_label": "Bm7/D",
+              "forbidden_primary_label": "Bm7"
+            },
+            {
+              "input_pitch_set": "D-F#-A-B with bass B",
+              "preferred_label": "Bm7",
+              "alternate_label": "D6/B"
+            }
+          ]
+        },
+        {
+          "id": "root_rule_same_root_family_before_upper_structure_promotion",
+          "description": "Before choosing a final label derived from an apparent upper-structure sonority, first test whether the sounding bass and observed structural tones already support a direct same-root chord family. This check is especially important for m7, maj7, and dominant-7 shells. If a same-root shell is convincingly present, use that family as the primary label and treat the upper-structure-derived reading as alternate unless it more faithfully represents the heard harmonic identity.",
+          "same_root_shell_examples": [
+            "1-b3-5-b7 -> m7 family",
+            "1-3-5-7 -> maj7 family",
+            "1-3-5-b7 -> dominant-7 family"
+          ],
+          "preferred_workflow": [
+            "identify sounding bass",
+            "test same-root shell completion or strong contextual recovery",
+            "add structurally supported tensions/colors to that same-root family",
+            "only then compare alternate upper-structure-derived labels"
+          ],
+          "examples": [
+            {
+              "input_context": "Bass Bb with Db-F-Ab clearly present and G also sounding",
+              "preferred_primary_label": "Bbm7 with added color/tension as justified",
+              "alternate_label": "G-based upper-structure reading stored only as alternate",
+              "reason": "The same-root Bbm7 shell is already established by the bass and structural tones."
+            }
+          ]
+        },
+        {
+          "id": "ext_rule_b_structural_7th_9th_promotion",
+          "description": "Evaluate each extension tone independently. Promote a 7th, 9th, 11th, or 13th from surface color to the structural label only if that specific extension itself is metrically strong, durationally salient, repeated, or otherwise structurally anchored.",
+          "promotion_conditions": {
+            "evaluation_scope": "per_extension_tone",
+            "required_evidence_for_that_extension": [
+              "strong_beat",
+              "long_duration",
+              "repetition",
+              "structural_rearticulation"
+            ],
+            "interpretation": "Do not promote all available extensions as a bundle. A strong/sustained 7th can justify maj7 or 7 without automatically justifying 9, 11, or 13. A 9th, 11th, or 13th must separately earn promotion through its own metrical or durational salience.",
+            "downgrade_rule": "If an extension appears only briefly off the beat, as a passing tone, or as an ornamental arpeggio step, keep it in surface_extensions instead of the primary structural label."
+          },
+          "examples": [
+            {
+              "input_pitch_set_context": "D-F#-A with strong sustained C#",
+              "preferred_structural_label": "Dmaj7",
+              "reason": "maj7 has strong local evidence; no independent evidence yet for 9."
+            },
+            {
+              "input_pitch_set_context": "D-F#-A with strong sustained C# and also strong sustained E",
+              "preferred_structural_label": "Dmaj9",
+              "reason": "Both maj7 and 9 independently meet promotion criteria."
+            },
+            {
+              "input_pitch_set_context": "D-F#-A with strong sustained E but no structural C#",
+              "preferred_structural_label": "Dadd9",
+              "reason": "9 is promoted independently; maj7 is not inferred when C# lacks structural evidence."
+            },
+            {
+              "input_pitch_set_context": "D-F#-A with strong C# on beat 1 and only a brief off-beat E later",
+              "preferred_structural_label": "Dmaj7",
+              "surface_extension": "9",
+              "reason": "maj7 is structural; 9 remains surface color because E does not independently qualify."
+            },
+            {
+              "input_pitch_set_context": "D-F#-A with only a brief passing E",
+              "preferred_structural_label": "D",
+              "surface_extension": "9"
+            }
+          ]
+        },
+        {
+          "id": "root_rule_c_boundary_bass_confirmation",
+          "description": "When a candidate root is suggested only by a very late or very early boundary-adjacent bass onset in humanized MIDI, do not let that bass override the current structural root unless the new bass is durationally meaningful or confirmed on the next strong pulse.",
+          "examples": [
+            {
+              "input_context": "A-C-Eb occupies most of the bar, B bass appears only at the very end",
+              "preferred_label": "A°/C",
+              "alternate_label": "B7(b9)",
+              "reason": "Boundary-adjacent B is treated as anticipation until structurally confirmed."
+            },
+            {
+              "input_context": "New bass enters slightly early but continues through the next strong beat with supporting tones",
+              "preferred_action": "Promote new bass-supported chord at the confirmed boundary."
+            }
+          ]
+        },
+        {
+          "id": "root_rule_d_unslashed_bass_mismatch_forbidden",
+          "description": "A primary label may not ignore the sounding bass. If the upper structure suggests a different root, either write the slash/inversion explicitly or choose a functionally equivalent bass-aware label. For example, bass E with upper notes F-Ab-B-D may be labeled F°/E or E7(b9), but never bare F° as the selected label.",
+          "examples": [
+            {
+              "input_pitch_set": "E bass with upper notes F-Ab-B-D",
+              "forbidden_primary_label": "F°",
+              "allowed_primary_labels": [
+                "F°/E",
+                "E7(b9)"
+              ],
+              "reason": "The actual sounding bass must remain visible in the selected label."
+            }
+          ]
+        },
+        {
+          "id": "root_rule_e_bass_melodic_motion_filter",
+          "description": "A brief bass note inside an otherwise stable chord should first be tested as melodic bass motion, passing bass, or line-cliché movement before being promoted to a new root. However, not every bass movement is melodic. If the new bass has meaningful duration and the upper structure also reorganizes around it, prefer a real chord split over forcing a single stable chord label.",
+          "promotion_requirements": [
+            "durational_significance",
+            "supporting_chord_tones",
+            "metrical_confirmation",
+            "upper_structure_continuity_check"
+          ],
+          "examples": [
+            {
+              "input_context": "G/B sonority remains stable while bass briefly passes through F before continuing",
+              "preferred_label": "G/B",
+              "surface_or_transition_tag": "F as bass passing motion",
+              "forbidden_primary_label": "F°",
+              "reason": "A fleeting bass passing tone without matching structural takeover does not justify a new chord root."
+            },
+            {
+              "input_context": "Bass moves from E to Bb and the upper notes reorganize from E-G#-B-D-F toward Bb with C-E-G before resolving to Am11",
+              "preferred_action": "Split into two structural chords instead of treating Bb as passing bass",
+              "preferred_labels": [
+                "E7(b9)",
+                "C7/Bb"
+              ],
+              "reason": "New bass plus upper-structure reorganization indicates a genuine within-bar harmonic change."
+            }
+          ],
+          "do_not_treat_as_mere_bass_melody_when": [
+            "new_bass_occupies_meaningful_portion_of_window",
+            "guide_tones_or_chord_tones_reform_around_new_bass",
+            "previous_chord_skeleton_no_longer_explains_surface_well",
+            "next_segment_or_resolution_confirms_new_local_sonority"
+          ]
+        },
+        {
+          "id": "root_rule_f_upper_structure_guided_bass_interpretation",
+          "description": "A changing bass note must not be interpreted in isolation. When bass motion occurs, determine whether it functions as melodic bass motion or as the root/bass of a new harmony by examining the simultaneous upper structure. If the upper harmony largely preserves the identity of the previous chord, interpret the bass motion first as passing bass, melodic bass line, line cliché, or connective low-note motion within the current harmony. If the bass changes together with a meaningful reorganization of the upper structure, and the new sonority is better explained as a distinct harmony than as a continuation of the previous one, promote it to a new chord candidate. Do not treat a bass change alone as sufficient evidence of harmonic change."
+        },
+        {
+          "id": "root_rule_g_upper_structure_reorganization_threshold",
+          "description": "Upper-structure reorganization must not be inferred from a single decorative tone, brief non-chord tone, arpeggiated subdivision, or ornamental anticipation alone. Treat the upper harmony as genuinely reorganized only when the structurally relevant tones above the bass shift in a way that changes the harmonic identity more convincingly than a continuation of the previous chord."
+        },
+        {
+          "id": "root_rule_h_upper_structure_change_must_be_harmonically_interpretable",
+          "description": "Do not judge upper-structure reorganization by note count alone. A changed upper sonority should be treated as a true harmonic change signal only if it is musically interpretable as a coherent local harmony, rather than as melody notes, decorative fills, or arpeggiated continuation over the same bass.",
+          "do_not_promote_as_new_harmony_when": [
+            "same_bass_continues_and_upper_notes_behave_like_melody_over_existing_chord",
+            "upper_motion_is_explained_as_arpeggiation_or_ornamental_fill",
+            "changed_notes_do_not_form_a_convincing_local_harmonic_identity"
+          ],
+          "promote_as_upper_structure_reorganization_when": [
+            "new_upper_sonority_is_harmonically_interpretable",
+            "previous_upper_identity_no_longer_explains_the_surface_well",
+            "the_new_sonority_is_more_convincing_as_a_local_chord_than_as_mere_melody"
+          ],
+          "examples": [
+            {
+              "input_context": "C major accompaniment remains over the same bass while upper notes move as a melodic line",
+              "preferred_action": "Keep the structural chord stable and treat the moving upper notes as melody or surface color",
+              "reason": "Upper-note motion alone does not create a new harmonic center when the local sonority is not independently chord-like."
+            }
+          ]
+        },
+        {
+          "id": "root_rule_i_bass_plus_interpretable_upper_change_confirms_new_local_harmony",
+          "description": "Treat upper-structure reorganization as strong evidence of a new local harmony when three conditions align: the bass changes, the upper sonority is itself harmonically interpretable, and the new sonority has meaningful relation to the surrounding progression or resolution. When these conditions are met, prefer explicit local chord segmentation over preserving the previous chord by inertia.",
+          "confirmation_factors": [
+            "bass_changes_in_a_structurally_meaningful_way",
+            "upper_structure_forms_an_interpretable_local_harmony",
+            "surrounding_progression_or_resolution_supports_the_new_sonority"
+          ],
+          "examples": [
+            {
+              "input_context": "Bass changes while the upper structure also forms a newly interpretable sonority that connects naturally with the previous and following chords",
+              "preferred_action": "Recognize a genuine local harmonic change",
+              "reason": "Bass motion plus interpretable upper re-centering plus progression logic together outweigh a surface-melody reading."
+            },
+            {
+              "input_context": "Bass stays fixed while upper notes move melodically and do not form a convincing independent harmony",
+              "preferred_action": "Do not treat the passage as upper-structure reorganization strong enough to create a new chord",
+              "reason": "Without bass support and harmonic interpretability, the passage behaves more like melodic decoration than harmonic reset."
+            }
+          ]
+        },
+        {
+          "id": "root_rule_f_within_bar_split_when_bass_and_upper_structure_change",
+          "description": "In humanized MIDI, allow a within-bar chord split when the bass changes in a durationally meaningful way and the upper structure also re-centers. The analyzer should not preserve one label across the whole window merely to avoid over-segmentation.",
+          "split_triggers": [
+            "new_bass_is_not_boundary_only_and_has_meaningful_duration",
+            "at_least_two_structural_or_guide_tones_support_the_new_local_sonority",
+            "metrical_position_is_reasonable_for_human_performance_even_if_not_exactly_quantized",
+            "following_resolution_or_neighboring_segment_confirms_the_new_chord"
+          ],
+          "anti_false_split_checks": [
+            "ignore_if_only_bass_moves_but_upper_structure_clearly_stays_the_same",
+            "ignore_if_new_bass_is_only_a_brief_pickup_or_release_overlap",
+            "ignore_if_previous_chord_skeleton_still_dominates_duration_and_meter"
+          ],
+          "examples": [
+            {
+              "input_context": "First half behaves like E7(b9), then Bb bass enters with upper C-E-G and resolves to Am11",
+              "preferred_output": [
+                "E7(b9)",
+                "C7/Bb",
+                "Am11"
+              ],
+              "reason": "Bass change plus upper-structure reset and semitone bass resolution justify separate local chords."
+            }
+          ]
+        },
+        {
+          "id": "root_rule_d_upper_dim_over_bass_to_dominant_b9",
+          "description": "When the upper structure forms a fully diminished seventh built a semitone above the bass-root candidate, strongly test the corresponding dominant7(b9) interpretation before emitting a bare diminished label that hides the bass.",
+          "examples": [
+            {
+              "sounding_bass": "E",
+              "upper_structure": [
+                "F",
+                "Ab",
+                "B",
+                "D"
+              ],
+              "preferred_final_label": "E7(b9)",
+              "allowed_literal_or_intermediate_labels": [
+                "F°/E",
+                "Fdim7/E"
+              ],
+              "forbidden_primary_label": "F°",
+              "reason": "The upper diminished set is real, but the final label must remain bass-aware and functionally useful."
+            }
+          ]
+        },
+        {
+          "id": "root_rule_e_incomplete_voicing_context_recovery",
+          "description": "If the current slice contains only a shell or partial voicing, use surrounding bars/beats, bass continuity, guide-tone motion, and resolution tendency to recover the most likely functional label. Store the confidence penalty separately from the chosen label.",
+          "preferred_context_clues": [
+            "bass_root_presence",
+            "guide_tone_motion",
+            "previous_segment_identity",
+            "next_segment_resolution",
+            "metrical_strength",
+            "duration_occupancy"
+          ]
+        },
+        {
+          "id": "root_rule_f_observed_pitch_conflict_check",
+          "description": "Before finalizing a functional label, compare it against the actually sounding structural tones. A functional label may infer omitted tones, but it should not erase strong observed tones that materially favor another local sonority unless emitted as an alternate."
+        }
+      ]
+    },
+    "meter_verification": {
+      "description": "Rules for verifying and potentially overriding the MIDI metadata time signature by analyzing actual rhythmic patterns in the performed note data. This is critical because many DAWs and notation programs export non-4/4 meters as 4/4 by default, and blindly trusting wrong metadata leads to incorrect harmonic segmentation.",
+      "rules": [
+        {
+          "id": "mv_do_not_trust_metadata_blindly",
+          "description": "MIDI time-signature metadata is a hint, not ground truth. Always verify against actual onset patterns before using it for harmonic window segmentation.",
+          "severity": "high"
+        },
+        {
+          "id": "mv_onset_histogram_method",
+          "description": "Build an onset-position histogram modulo candidate cycle lengths. For each candidate meter (2/4, 3/4, 4/4, 6/8, 9/8, 12/8, 5/4, 7/8), map all note onsets to positions within one cycle and measure how well the velocity/density accent pattern matches the expected metric hierarchy.",
+          "candidate_meters": [
+            {
+              "meter": "4/4",
+              "cycle_in_eighth_notes": 8,
+              "primary_accent_positions": [
+                0
+              ],
+              "secondary_accent_positions": [
+                4
+              ],
+              "weak_positions": [
+                2,
+                6
+              ],
+              "subdivision": "simple_duple"
+            },
+            {
+              "meter": "3/4",
+              "cycle_in_eighth_notes": 6,
+              "primary_accent_positions": [
+                0
+              ],
+              "secondary_accent_positions": [
+                2,
+                4
+              ],
+              "weak_positions": [
+                1,
+                3,
+                5
+              ],
+              "subdivision": "simple_triple"
+            },
+            {
+              "meter": "6/8",
+              "cycle_in_eighth_notes": 6,
+              "primary_accent_positions": [
+                0
+              ],
+              "secondary_accent_positions": [
+                3
+              ],
+              "weak_positions": [
+                1,
+                2,
+                4,
+                5
+              ],
+              "subdivision": "compound_duple",
+              "primary_beat_unit": "dotted_quarter"
+            },
+            {
+              "meter": "2/4",
+              "cycle_in_eighth_notes": 4,
+              "primary_accent_positions": [
+                0
+              ],
+              "secondary_accent_positions": [
+                2
+              ],
+              "weak_positions": [
+                1,
+                3
+              ],
+              "subdivision": "simple_duple"
+            },
+            {
+              "meter": "9/8",
+              "cycle_in_eighth_notes": 9,
+              "primary_accent_positions": [
+                0
+              ],
+              "secondary_accent_positions": [
+                3,
+                6
+              ],
+              "weak_positions": [
+                1,
+                2,
+                4,
+                5,
+                7,
+                8
+              ],
+              "subdivision": "compound_triple",
+              "primary_beat_unit": "dotted_quarter"
+            },
+            {
+              "meter": "12/8",
+              "cycle_in_eighth_notes": 12,
+              "primary_accent_positions": [
+                0
+              ],
+              "secondary_accent_positions": [
+                3,
+                6,
+                9
+              ],
+              "weak_positions": [
+                1,
+                2,
+                4,
+                5,
+                7,
+                8,
+                10,
+                11
+              ],
+              "subdivision": "compound_quadruple",
+              "primary_beat_unit": "dotted_quarter"
+            },
+            {
+              "meter": "5/4",
+              "cycle_in_eighth_notes": 10,
+              "primary_accent_positions": [
+                0
+              ],
+              "secondary_accent_positions": [
+                4,
+                6
+              ],
+              "weak_positions": [
+                1,
+                2,
+                3,
+                5,
+                7,
+                8,
+                9
+              ],
+              "subdivision": "asymmetric",
+              "common_groupings": [
+                "3+2",
+                "2+3"
+              ]
+            },
+            {
+              "meter": "7/8",
+              "cycle_in_eighth_notes": 7,
+              "primary_accent_positions": [
+                0
+              ],
+              "secondary_accent_positions": [
+                3,
+                5
+              ],
+              "weak_positions": [
+                1,
+                2,
+                4,
+                6
+              ],
+              "subdivision": "asymmetric",
+              "common_groupings": [
+                "2+2+3",
+                "3+2+2",
+                "2+3+2"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "mv_bass_accent_cycle",
+          "description": "Bass onsets are the strongest indicator of metric downbeats. Identify the periodic cycle of bass-note onsets and compare to candidate meters. In 6/8, bass typically occurs on the dotted-quarter pulse (every 3 eighth-notes). In 4/4, bass typically occurs on beats 1 and 3 (every 2 quarter-notes = 4 eighth-notes).",
+          "weight": 0.4
+        },
+        {
+          "id": "mv_velocity_accent_profile",
+          "description": "Higher velocity on certain positions indicates metric accent. Aggregate velocities at each position in the candidate cycle. Strong velocity peaks matching the candidate's primary_accent_positions increase confidence in that meter.",
+          "weight": 0.25
+        },
+        {
+          "id": "mv_note_density_profile",
+          "description": "More simultaneous note onsets at a position suggest a structural downbeat. Chord attacks (multiple notes at once) tend to fall on strong beats.",
+          "weight": 0.2
+        },
+        {
+          "id": "mv_subdivision_regularity",
+          "description": "Examine inter-onset intervals (IOIs). If the dominant IOI is a triplet subdivision of the quarter-note (tpqn/3 or tpqn*2/3), compound meter is likely. If the dominant IOI is a binary subdivision (tpqn/2 or tpqn), simple meter is likely.",
+          "weight": 0.15,
+          "examples": [
+            {
+              "scenario": "tpqn=480, dominant IOI=240 (eighth note in simple time) or 160 (triplet)",
+              "if_IOI_240": "simple meter likely (4/4, 3/4, 2/4)",
+              "if_IOI_160": "compound meter likely (6/8, 9/8, 12/8)"
+            },
+            {
+              "scenario": "tpqn=480, onsets cluster at 0, 240, 480, 720, 960, 1200...",
+              "interpretation": "eighth-note grid, could be simple or compound depending on accent pattern"
+            },
+            {
+              "scenario": "tpqn=480, bass onsets at 0, 720, 1440, 2160...",
+              "interpretation": "cycle of 720 ticks = dotted quarter = strong evidence for 6/8"
+            }
+          ]
+        },
+        {
+          "id": "mv_3vs4_disambiguation",
+          "description": "Distinguishing 6/8 from 3/4 when both have a 6-eighth-note cycle: 6/8 groups as 3+3 (two dotted-quarter beats, internal subdivision in threes), 3/4 groups as 2+2+2 (three quarter-note beats, internal subdivision in twos). Check whether inner subdivisions cluster at positions 0,2,4 (3/4 feel) or 0,3 (6/8 feel). Also check harmonic rhythm: if chords change at dotted-quarter intervals, 6/8 is more likely; if they change at quarter-note intervals, 3/4.",
+          "disambiguation_signals": [
+            {
+              "signal": "bass_on_0_and_3_only",
+              "favors": "6/8"
+            },
+            {
+              "signal": "bass_on_0_2_4",
+              "favors": "3/4"
+            },
+            {
+              "signal": "arpeggio_groups_of_3_eighth_notes",
+              "favors": "6/8"
+            },
+            {
+              "signal": "chord_changes_every_dotted_quarter",
+              "favors": "6/8"
+            },
+            {
+              "signal": "chord_changes_every_quarter",
+              "favors": "3/4"
+            },
+            {
+              "signal": "melody_phrasing_in_groups_of_3",
+              "favors": "6/8"
+            },
+            {
+              "signal": "equal_weight_on_beats_1_2_3",
+              "favors": "3/4"
+            }
+          ]
+        },
+        {
+          "id": "mv_override_policy",
+          "description": "When the pattern-derived meter has significantly higher confidence than the MIDI metadata meter, override the metadata for all subsequent analysis steps. Log the override as a warning in the output report. If confidence is close (within 15%), report both interpretations and mark the analysis as meter-ambiguous.",
+          "confidence_threshold_to_override": 0.7,
+          "confidence_margin_for_ambiguity": 0.15
+        },
+        {
+          "id": "mv_compound_meter_window_adjustment",
+          "description": "When compound meter is confirmed (6/8, 9/8, 12/8), redefine analysis windows: the 'beat' unit becomes the dotted quarter-note (3 eighth-notes), the 'bar' becomes the full compound cycle, and 'half-bar' splits at the compound beat boundary (e.g. in 6/8, half-bar = 3 eighth-notes = one dotted quarter).",
+          "window_mapping": {
+            "6/8": {
+              "bar_in_ticks": "tpqn * 3",
+              "beat_in_ticks": "tpqn * 3 / 2",
+              "note": "One bar of 6/8 = 6 eighth notes = 3 quarter notes worth of ticks. Primary beats fall at 0 and tpqn*3/2 (i.e. every dotted quarter)."
+            },
+            "9/8": {
+              "bar_in_ticks": "tpqn * 9 / 2",
+              "beat_in_ticks": "tpqn * 3 / 2"
+            },
+            "12/8": {
+              "bar_in_ticks": "tpqn * 6",
+              "beat_in_ticks": "tpqn * 3 / 2"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "chord_quality_rules": [
+    {
+      "id": "cq_maj7",
+      "chord_quality": "maj7",
+      "function_group": "tonic",
+      "chord_tones": [
+        "1",
+        "3",
+        "5",
+        "7"
+      ],
+      "priority_tones": [
+        {
+          "degree": "3",
+          "score": 1.0
+        },
+        {
+          "degree": "7",
+          "score": 1.0
+        },
+        {
+          "degree": "1",
+          "score": 0.8
+        },
+        {
+          "degree": "5",
+          "score": 0.5
+        }
+      ],
+      "available_tensions": [
+        {
+          "degree": "9",
+          "score": 0.8
+        },
+        {
+          "degree": "13",
+          "score": 0.75
+        },
+        {
+          "degree": "#11",
+          "score": 0.9,
+          "context": "lydian"
+        }
+      ],
+      "avoid_tones": [
+        {
+          "degree": "11",
+          "severity": "high",
+          "reason": "minor ninth clash against major third on strong beat"
+        }
+      ],
+      "preferred_bass_options": [
+        "1",
+        "3",
+        "5"
+      ],
+      "allowed_inversions": [
+        {
+          "bass_degree": "1",
+          "score": 1.0
+        },
+        {
+          "bass_degree": "3",
+          "score": 0.85
+        },
+        {
+          "bass_degree": "5",
+          "score": 0.6
+        },
+        {
+          "bass_degree": "7",
+          "score": 0.3
+        }
+      ],
+      "top_note_preferences": [
+        {
+          "degree": "3",
+          "score": 0.95
+        },
+        {
+          "degree": "7",
+          "score": 0.9
+        },
+        {
+          "degree": "9",
+          "score": 0.85
+        },
+        {
+          "degree": "13",
+          "score": 0.7
+        }
+      ]
+    },
+    {
+      "id": "cq_m7",
+      "chord_quality": "m7",
+      "function_group": "predominant",
+      "chord_tones": [
+        "1",
+        "b3",
+        "5",
+        "b7"
+      ],
+      "priority_tones": [
+        {
+          "degree": "b3",
+          "score": 1.0
+        },
+        {
+          "degree": "b7",
+          "score": 1.0
+        },
+        {
+          "degree": "1",
+          "score": 0.8
+        },
+        {
+          "degree": "5",
+          "score": 0.5
+        }
+      ],
+      "available_tensions": [
+        {
+          "degree": "9",
+          "score": 0.85
+        },
+        {
+          "degree": "11",
+          "score": 0.9
+        },
+        {
+          "degree": "13",
+          "score": 0.7,
+          "context": "dorian"
+        },
+        {
+          "degree": "b13",
+          "score": 0.6,
+          "context": "aeolian"
+        }
+      ],
+      "avoid_tones": [],
+      "preferred_bass_options": [
+        "1",
+        "5",
+        "b3"
+      ],
+      "allowed_inversions": [
+        {
+          "bass_degree": "1",
+          "score": 1.0
+        },
+        {
+          "bass_degree": "5",
+          "score": 0.75
+        },
+        {
+          "bass_degree": "b3",
+          "score": 0.65
+        },
+        {
+          "bass_degree": "b7",
+          "score": 0.35
+        }
+      ],
+      "top_note_preferences": [
+        {
+          "degree": "b3",
+          "score": 0.95
+        },
+        {
+          "degree": "11",
+          "score": 0.9
+        },
+        {
+          "degree": "9",
+          "score": 0.85
+        },
+        {
+          "degree": "b7",
+          "score": 0.8
+        }
+      ]
+    },
+    {
+      "id": "cq_dom7",
+      "chord_quality": "7",
+      "function_group": "dominant",
+      "chord_tones": [
+        "1",
+        "3",
+        "5",
+        "b7"
+      ],
+      "priority_tones": [
+        {
+          "degree": "3",
+          "score": 1.0
+        },
+        {
+          "degree": "b7",
+          "score": 1.0
+        },
+        {
+          "degree": "1",
+          "score": 0.7
+        },
+        {
+          "degree": "5",
+          "score": 0.4
+        }
+      ],
+      "available_tensions": [
+        {
+          "degree": "9",
+          "score": 0.75
+        },
+        {
+          "degree": "13",
+          "score": 0.8
+        },
+        {
+          "degree": "b9",
+          "score": 0.85,
+          "context": "dominant_to_minor_or_explicit_tensioned_dominant"
+        },
+        {
+          "degree": "#9",
+          "score": 0.8,
+          "context": "explicit_tensioned_dominant"
+        },
+        {
+          "degree": "#11",
+          "score": 0.75,
+          "context": "lydian_dominant"
+        },
+        {
+          "degree": "b13",
+          "score": 0.8,
+          "context": "explicit_tensioned_dominant"
+        }
+      ],
+      "avoid_tones": [
+        {
+          "degree": "11",
+          "severity": "high",
+          "reason": "clashes against major third unless treated as sus"
+        }
+      ],
+      "preferred_bass_options": [
+        "1",
+        "3",
+        "b7"
+      ],
+      "allowed_inversions": [
+        {
+          "bass_degree": "1",
+          "score": 1.0
+        },
+        {
+          "bass_degree": "3",
+          "score": 0.9
+        },
+        {
+          "bass_degree": "b7",
+          "score": 0.7
+        },
+        {
+          "bass_degree": "5",
+          "score": 0.35
+        }
+      ],
+      "top_note_preferences": [
+        {
+          "degree": "3",
+          "score": 0.95
+        },
+        {
+          "degree": "b7",
+          "score": 0.95
+        },
+        {
+          "degree": "b9",
+          "score": 0.9
+        },
+        {
+          "degree": "13",
+          "score": 0.8
+        },
+        {
+          "degree": "#9",
+          "score": 0.8
+        }
+      ],
+      "final_label_policy": {
+        "description": "Do not use a catch-all dominant label in place of explicit dominant tension labeling. When structurally supported dominant tensions are present, append the actually supported tensions explicitly to the dominant label, such as 7(b9), 7(#9), 7(b13), 7(#11), 7(b9,b13), or other supported combinations. Do not promote brief ornamental, passing, anticipatory, or weakly supported tones into final tension text."
+      }
+    },
+    {
+      "id": "cq_m7b5",
+      "chord_quality": "m7b5",
+      "function_group": "predominant_minor",
+      "chord_tones": [
+        "1",
+        "b3",
+        "b5",
+        "b7"
+      ],
+      "priority_tones": [
+        {
+          "degree": "b3",
+          "score": 1.0
+        },
+        {
+          "degree": "b5",
+          "score": 0.95
+        },
+        {
+          "degree": "b7",
+          "score": 0.95
+        },
+        {
+          "degree": "1",
+          "score": 0.75
+        }
+      ],
+      "available_tensions": [
+        {
+          "degree": "11",
+          "score": 0.9
+        },
+        {
+          "degree": "b13",
+          "score": 0.75
+        },
+        {
+          "degree": "9",
+          "score": 0.45,
+          "context": "locrian"
+        },
+        {
+          "degree": "9",
+          "score": 0.75,
+          "context": "locrian_sharp2"
+        }
+      ],
+      "avoid_tones": [],
+      "preferred_bass_options": [
+        "1",
+        "b5"
+      ],
+      "allowed_inversions": [
+        {
+          "bass_degree": "1",
+          "score": 1.0
+        },
+        {
+          "bass_degree": "b5",
+          "score": 0.8
+        },
+        {
+          "bass_degree": "b3",
+          "score": 0.45
+        },
+        {
+          "bass_degree": "b7",
+          "score": 0.3
+        }
+      ],
+      "top_note_preferences": [
+        {
+          "degree": "11",
+          "score": 0.9
+        },
+        {
+          "degree": "b3",
+          "score": 0.85
+        },
+        {
+          "degree": "b5",
+          "score": 0.8
+        },
+        {
+          "degree": "b7",
+          "score": 0.8
+        }
+      ]
+    },
+    {
+      "id": "cq_7sus",
+      "chord_quality": "7sus",
+      "function_group": "dominant_suspended",
+      "chord_tones": [
+        "1",
+        "4",
+        "5",
+        "b7"
+      ],
+      "priority_tones": [
+        {
+          "degree": "4",
+          "score": 1.0
+        },
+        {
+          "degree": "b7",
+          "score": 0.95
+        },
+        {
+          "degree": "1",
+          "score": 0.8
+        },
+        {
+          "degree": "5",
+          "score": 0.55
+        }
+      ],
+      "available_tensions": [
+        {
+          "degree": "9",
+          "score": 0.9
+        },
+        {
+          "degree": "13",
+          "score": 0.8
+        }
+      ],
+      "avoid_tones": [
+        {
+          "degree": "3",
+          "severity": "medium",
+          "reason": "do not sustain major 3rd against 4th unless resolving"
+        }
+      ],
+      "preferred_bass_options": [
+        "1",
+        "5"
+      ],
+      "allowed_inversions": [
+        {
+          "bass_degree": "1",
+          "score": 1.0
+        },
+        {
+          "bass_degree": "5",
+          "score": 0.75
+        },
+        {
+          "bass_degree": "b7",
+          "score": 0.45
+        }
+      ],
+      "top_note_preferences": [
+        {
+          "degree": "4",
+          "score": 0.95
+        },
+        {
+          "degree": "9",
+          "score": 0.9
+        },
+        {
+          "degree": "13",
+          "score": 0.75
+        }
+      ]
+    }
+  ],
+  "voicing_templates": [
+    {
+      "id": "vt_shell_root",
+      "name": "shell_root_position",
+      "applies_to": [
+        "maj7",
+        "m7",
+        "7",
+        "m7b5",
+        "7sus",
+        "7_explicit_tension_labels"
+      ],
+      "hands": {
+        "left_hand": [
+          "1",
+          "7_or_b7"
+        ],
+        "right_hand": [
+          "3_or_b3",
+          "5_or_tension"
+        ]
+      },
+      "note_count_range": {
+        "min": 3,
+        "max": 4
+      },
+      "register_profile": {
+        "left_hand_midi_range": [
+          36,
+          55
+        ],
+        "right_hand_midi_range": [
+          55,
+          79
+        ]
+      },
+      "playability_score": 0.95
+    },
+    {
+      "id": "vt_rootless_A",
+      "name": "rootless_A_type",
+      "applies_to": [
+        "maj7",
+        "m7",
+        "7"
+      ],
+      "hands": {
+        "left_hand": [
+          "3_or_b3",
+          "7_or_b7"
+        ],
+        "right_hand": [
+          "9_or_1",
+          "5_or_13"
+        ]
+      },
+      "note_count_range": {
+        "min": 4,
+        "max": 4
+      },
+      "register_profile": {
+        "left_hand_midi_range": [
+          43,
+          60
+        ],
+        "right_hand_midi_range": [
+          60,
+          81
+        ]
+      },
+      "playability_score": 0.9
+    },
+    {
+      "id": "vt_spread_ballad",
+      "name": "spread_ballad_voicing",
+      "applies_to": [
+        "maj7",
+        "m7",
+        "7sus",
+        "6",
+        "69"
+      ],
+      "hands": {
+        "left_hand": [
+          "1",
+          "5"
+        ],
+        "right_hand": [
+          "3_or_b3_or_4",
+          "7_or_6_or_b7",
+          "9_or_13"
+        ]
+      },
+      "note_count_range": {
+        "min": 4,
+        "max": 5
+      },
+      "register_profile": {
+        "left_hand_midi_range": [
+          33,
+          52
+        ],
+        "right_hand_midi_range": [
+          57,
+          84
+        ]
+      },
+      "playability_score": 0.92
+    },
+    {
+      "id": "vt_explicit_tension_dominant_compact",
+      "name": "explicit_tensioned_dominant_compact",
+      "applies_to": [
+        "7_explicit_tension_labels"
+      ],
+      "hands": {
+        "left_hand": [
+          "1_or_3",
+          "b7"
+        ],
+        "right_hand": [
+          "b9_or_#9",
+          "#11_or_b13"
+        ]
+      },
+      "note_count_range": {
+        "min": 4,
+        "max": 4
+      },
+      "register_profile": {
+        "left_hand_midi_range": [
+          38,
+          55
+        ],
+        "right_hand_midi_range": [
+          60,
+          83
+        ]
+      },
+      "playability_score": 0.78,
+      "description": "Compact voicing family for dominant chords whose supported tensions must be labeled explicitly rather than merged into a generic dominant bucket."
+    },
+    {
+      "id": "vt_ballad_root10",
+      "name": "ballad_root_10th_support",
+      "applies_to": [
+        "maj7",
+        "m7",
+        "6",
+        "69",
+        "add9"
+      ],
+      "hands": {
+        "left_hand": [
+          "1",
+          "10_or_b10"
+        ],
+        "right_hand": [
+          "5_or_9",
+          "3_or_7"
+        ]
+      },
+      "note_count_range": {
+        "min": 4,
+        "max": 4
+      },
+      "register_profile": {
+        "left_hand_midi_range": [
+          33,
+          55
+        ],
+        "right_hand_midi_range": [
+          57,
+          84
+        ]
+      },
+      "style_bias": [
+        "ballad",
+        "pop_jazz"
+      ],
+      "playability_score": 0.93
+    },
+    {
+      "id": "vt_melody_top_support",
+      "name": "melody_top_support_voicing",
+      "applies_to": [
+        "maj7",
+        "m7",
+        "7",
+        "m7b5",
+        "6",
+        "69",
+        "add9",
+        "7sus"
+      ],
+      "hands": {
+        "left_hand": [
+          "1_or_5",
+          "7_or_b7_optional"
+        ],
+        "right_hand": [
+          "guide_tone",
+          "support_tension_or_5",
+          "melody_top"
+        ]
+      },
+      "note_count_range": {
+        "min": 3,
+        "max": 5
+      },
+      "register_profile": {
+        "left_hand_midi_range": [
+          36,
+          55
+        ],
+        "right_hand_midi_range": [
+          58,
+          88
+        ]
+      },
+      "style_bias": [
+        "ballad",
+        "jazz",
+        "pop_jazz",
+        "modern_jazz"
+      ],
+      "playability_score": 0.94
+    }
+  ],
+  "playability_constraints": {
+    "left_hand_max_semitones": 12,
+    "right_hand_max_semitones": 11,
+    "advanced_mode_left_hand_max": 14,
+    "advanced_mode_right_hand_max": 13,
+    "recommended_max_simultaneous_left_hand_notes": 2,
+    "max_simultaneous_left_hand_notes": 3,
+    "preferred_top_note_midi_range": [
+      60,
+      84
+    ],
+    "hard_top_note_midi_range": [
+      55,
+      88
+    ],
+    "cross_hand_avoid": true,
+    "low_register_interval_rules": [
+      {
+        "below_midi": 40,
+        "forbid_intervals": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      },
+      {
+        "below_midi": 48,
+        "forbid_dense_three_note_stack_within_semitones": 7
+      }
+    ]
+  },
+  "inversion_rules": [
+    {
+      "id": "inv_tonic_stability",
+      "applies_to_function": "tonic",
+      "preferred_inversions": [
+        {
+          "bass_degree": "1",
+          "score": 1.0
+        },
+        {
+          "bass_degree": "3",
+          "score": 0.8
+        },
+        {
+          "bass_degree": "5",
+          "score": 0.55
+        },
+        {
+          "bass_degree": "7",
+          "score": 0.2
+        }
+      ],
+      "notes": "Use root position most often for strong arrival; first inversion allowed for smoother bass line."
+    },
+    {
+      "id": "inv_predominant_flex",
+      "applies_to_function": "predominant",
+      "preferred_inversions": [
+        {
+          "bass_degree": "1",
+          "score": 0.95
+        },
+        {
+          "bass_degree": "5",
+          "score": 0.75
+        },
+        {
+          "bass_degree": "b3",
+          "score": 0.65
+        },
+        {
+          "bass_degree": "b7",
+          "score": 0.35
+        }
+      ],
+      "notes": "First and second inversion may be used to connect bass smoothly into dominant."
+    },
+    {
+      "id": "inv_dominant_resolution_bias",
+      "applies_to_function": "dominant",
+      "preferred_inversions": [
+        {
+          "bass_degree": "1",
+          "score": 1.0
+        },
+        {
+          "bass_degree": "3",
+          "score": 0.9
+        },
+        {
+          "bass_degree": "b7",
+          "score": 0.65
+        },
+        {
+          "bass_degree": "5",
+          "score": 0.25
+        }
+      ],
+      "notes": "Third in bass can strongly pull to tonic; fifth in bass is weak unless special line-cliche context."
+    }
+  ],
+  "progression_resolution_rules": [
+    {
+      "id": "pr_ii_V",
+      "progression": [
+        "m7",
+        "7"
+      ],
+      "guide_tone_rules": [
+        {
+          "from_degree": "b3",
+          "to_degree": "b7",
+          "motion": "common_tone_preferred",
+          "score": 0.95
+        },
+        {
+          "from_degree": "b7",
+          "to_degree": "3",
+          "motion": "down_semitone",
+          "score": 1.0
+        }
+      ],
+      "top_note_targets": [
+        {
+          "strategy": "hold_common_tone_if_available",
+          "score": 0.85
+        },
+        {
+          "strategy": "stepwise_motion",
+          "score": 0.9
+        }
+      ]
+    },
+    {
+      "id": "pr_V_I",
+      "progression": [
+        "7",
+        "maj7"
+      ],
+      "guide_tone_rules": [
+        {
+          "from_degree": "3",
+          "to_degree": "7",
+          "motion": "common_tone_or_hold",
+          "score": 0.85
+        },
+        {
+          "from_degree": "b7",
+          "to_degree": "3",
+          "motion": "down_semitone",
+          "score": 1.0
+        },
+        {
+          "from_degree": "b9",
+          "to_degree": "5_or_3",
+          "motion": "down_semitone_or_step",
+          "score": 0.9
+        }
+      ],
+      "top_note_targets": [
+        {
+          "strategy": "resolve_tension_downward",
+          "score": 1.0
+        },
+        {
+          "strategy": "land_on_3_or_9",
+          "score": 0.95
+        }
+      ]
+    },
+    {
+      "id": "pr_iio_V7_explicit_tension_i",
+      "progression": [
+        "m7b5",
+        "7_explicit_tension_labels",
+        "m7"
+      ],
+      "guide_tone_rules": [
+        {
+          "from_degree": "b5",
+          "to_degree": "3",
+          "motion": "down_semitone_or_common_contextual",
+          "score": 0.8
+        },
+        {
+          "from_degree": "b7",
+          "to_degree": "3",
+          "motion": "down_semitone",
+          "score": 0.95
+        },
+        {
+          "from_degree": "b9",
+          "to_degree": "5_or_b3",
+          "motion": "down_semitone",
+          "score": 0.9
+        }
+      ],
+      "description": "Minor-key iiø–V–i motion where the dominant should be labeled by its explicitly supported tensions rather than by a generic catch-all dominant label."
+    },
+    {
+      "id": "pr_backdoor",
+      "progression": [
+        "m7",
+        "bVII7",
+        "maj7"
+      ],
+      "top_note_targets": [
+        {
+          "strategy": "smooth_descending_line",
+          "score": 0.85
+        },
+        {
+          "strategy": "favor_color_tones_9_13_on_tonic",
+          "score": 0.8
+        }
+      ]
+    },
+    {
+      "id": "pr_secondary_dominant_general",
+      "progression": [
+        "X7",
+        "target_diatonic_or_tonicized_chord"
+      ],
+      "description": "General secondary-dominant logic. If a dominant-quality sonority resolves convincingly to a local target chord, prefer the functional label V7/x over a literal enharmonic spelling. Use only when dominant evidence clearly exceeds borrowed/modal/color alternatives.",
+      "guide_tone_rules": [
+        {
+          "from_degree": "3",
+          "to_degree": "1_or_7_of_target",
+          "motion": "up_semitone_or_hold_contextual",
+          "score": 0.9
+        },
+        {
+          "from_degree": "b7",
+          "to_degree": "3_of_target",
+          "motion": "down_semitone_or_step",
+          "score": 1.0
+        },
+        {
+          "from_degree": "b9_or_other_explicit_dominant_tension",
+          "to_degree": "5_or_3_of_target",
+          "motion": "down_semitone_or_step",
+          "score": 0.9
+        }
+      ],
+      "labeling_bias": {
+        "prefer_functional_roman_numeral": true,
+        "prefer_contextual_respelling": true
+      },
+      "guardrails": [
+        "Do not force V7/x if resolution is weak, delayed, stylistically coloristic, or better explained by modal interchange / passing color."
+      ]
+    },
+    {
+      "id": "pr_V7_vi",
+      "progression": [
+        "V7/vi",
+        "vi_or_vi7"
+      ],
+      "description": "When a dominant resolves convincingly to vi, prefer V7/vi analysis even if MIDI pitch-classes look like an enharmonic flat-key dominant.",
+      "guide_tone_rules": [
+        {
+          "from_degree": "3",
+          "to_degree": "1_of_vi",
+          "motion": "up_semitone",
+          "score": 0.95
+        },
+        {
+          "from_degree": "b7",
+          "to_degree": "b3_or_3_of_vi_contextual",
+          "motion": "down_semitone_or_step",
+          "score": 0.95
+        }
+      ],
+      "top_note_targets": [
+        {
+          "strategy": "resolve_explicit_dominant_tensions_stepwise",
+          "score": 0.92
+        },
+        {
+          "strategy": "favor_clear_arrival_on_target_chord_tone",
+          "score": 0.9
+        }
+      ]
+    },
+    {
+      "id": "pr_sus_dominant_resolution",
+      "progression": [
+        "7sus",
+        "maj7_or_m7_target"
+      ],
+      "description": "Suspended dominants may delay the third but should still be evaluated by their eventual dominant resolution behavior.",
+      "top_note_targets": [
+        {
+          "strategy": "retain_suspension_then_release_stepwise",
+          "score": 0.88
+        },
+        {
+          "strategy": "favor_9_or_13_color_on_sus_if_style_allows",
+          "score": 0.8
+        }
+      ]
+    },
+    {
+      "id": "pr_modal_interchange_iv_i",
+      "progression": [
+        "iv_or_ivm6",
+        "I_or_i_contextual"
+      ],
+      "description": "Borrowed iv in major or parallel-minor inflection should be available as a non-diatonic color option, especially in ballad, cinematic, and pop-jazz contexts.",
+      "top_note_targets": [
+        {
+          "strategy": "common_tone_or_descending_step",
+          "score": 0.88
+        },
+        {
+          "strategy": "favor_expressive_b6_to_5_resolution_if_present",
+          "score": 0.9
+        }
+      ],
+      "labeling_bias": {
+        "prefer_borrowed_modal_label_over_secondary_dominant_when_resolution_is_plagal_or_coloristic": true
+      }
+    },
+    {
+      "id": "pr_bVII_I_or_backdoor_family",
+      "progression": [
+        "bVII_or_bVII7",
+        "I_or_i_contextual"
+      ],
+      "description": "bVII-family harmony may function as borrowed color, backdoor dominant, or modal-rock color; do not reduce every case to secondary-dominant logic.",
+      "top_note_targets": [
+        {
+          "strategy": "descending_whole_step_or_common_tone",
+          "score": 0.84
+        }
+      ]
+    },
+    {
+      "id": "pr_passing_diminished_connective",
+      "progression": [
+        "stable_chord",
+        "passing_dim_or_common_tone_dim",
+        "stable_target"
+      ],
+      "description": "Passing diminished chords often act as connective voice-leading devices rather than full functional dominants.",
+      "top_note_targets": [
+        {
+          "strategy": "semitone_voice_leading_priority",
+          "score": 0.92
+        }
+      ],
+      "labeling_bias": {
+        "prefer_connective_dim_label_when_duration_is_short_and_resolution_is_smooth": true
+      }
+    },
+    {
+      "id": "pr_tritone_sub_general",
+      "progression": [
+        "subV_of_target",
+        "target_chord"
+      ],
+      "description": "Allow tritone substitutions as a separate non-diatonic family when dominant-style resolution is present but root motion reflects substitute behavior.",
+      "guide_tone_rules": [
+        {
+          "from_degree": "3_and_b7_of_subV",
+          "to_degree": "target_tones",
+          "motion": "dominant_like_resolution",
+          "score": 0.9
+        }
+      ],
+      "labeling_bias": {
+        "prefer_tritone_sub_label_over_literal_unrelated_dominant": true
+      }
+    },
+    {
+      "id": "pr_color_planing_nonfunctional",
+      "progression": [
+        "planed_color_chord",
+        "planed_color_chord_next"
+      ],
+      "description": "When harmony moves in parallel color blocks without clear tonicization, preserve a non-functional/color interpretation instead of forcing dominant analysis.",
+      "top_note_targets": [
+        {
+          "strategy": "preserve_parallel_shape_and_surface_color",
+          "score": 0.8
+        }
+      ]
+    }
+  ],
+  "melody_alignment_rules": {
+    "description": "Melody-aware accompaniment and top-note handling.",
+    "rules": [
+      {
+        "id": "mar_follow_melody_support",
+        "mode": "follow_melody",
+        "description": "Top note may double melody when accompaniment is supportive and texture is sparse or medium.",
+        "top_note_relation_to_melody": [
+          {
+            "interval_semitones": 0,
+            "score": 1.0
+          },
+          {
+            "interval_semitones": -12,
+            "score": 0.85
+          },
+          {
+            "interval_semitones": -3,
+            "score": 0.6,
+            "context": "parallel_harmony"
+          },
+          {
+            "interval_semitones": -4,
+            "score": 0.6,
+            "context": "parallel_harmony"
+          }
+        ]
+      },
+      {
+        "id": "mar_avoid_minor9_clash",
+        "mode": "protect_melody",
+        "description": "Avoid top note creating harsh minor ninth clash against melody on strong beats.",
+        "forbidden_intervals_against_melody_on_strong_beat": [
+          1,
+          13,
+          -1,
+          -13
+        ],
+        "penalty_if_exceeded": 1.0
+      },
+      {
+        "id": "mar_prefer_chord_tone_under_nonchord_melody",
+        "mode": "support_melody",
+        "description": "If melody note is a passing tone / neighbor / suspension, accompaniment top note should prefer stable chord tone.",
+        "if_melody_role": [
+          "passing_tone",
+          "neighbor_tone",
+          "suspension"
+        ],
+        "preferred_top_note_degrees": [
+          "3",
+          "7",
+          "1",
+          "5"
+        ],
+        "score_boost": 0.25
+      },
+      {
+        "id": "mar_counter_motion",
+        "mode": "counter_line",
+        "description": "Prefer gentle contrary or oblique motion against melody in lyrical accompaniment.",
+        "preferred_motion_relative_to_melody": [
+          "contrary",
+          "oblique"
+        ],
+        "acceptable_motion_relative_to_melody": [
+          "similar_stepwise"
+        ],
+        "discouraged_motion_relative_to_melody": [
+          "similar_large_leap"
+        ]
+      },
+      {
+        "id": "mar_prefer_melody_as_top_note_when_stable",
+        "mode": "follow_melody",
+        "description": "If the melody note is a stable chord tone on a strong beat, prefer accompaniment voicings whose top note either matches the melody or stays safely below it without creating a clash.",
+        "if_melody_role": [
+          "chord_tone_primary",
+          "accented_stable_tension"
+        ],
+        "preferred_top_note_degrees": [
+          "same_as_melody",
+          "3",
+          "7",
+          "9"
+        ],
+        "score_boost": 0.22
+      },
+      {
+        "id": "mar_strong_beat_prefers_stable_support",
+        "mode": "support_melody",
+        "description": "On strong beats, accompaniment should favor root, 3rd, 7th, or clearly sanctioned style-dependent tensions rather than ambiguous chromatic color under the melody.",
+        "preferred_top_note_degrees": [
+          "1",
+          "3",
+          "7",
+          "5",
+          "9"
+        ],
+        "penalized_top_note_roles": [
+          "unprepared_chromatic_upper_neighbor",
+          "unresolved_avoid_tone"
+        ],
+        "score_boost": 0.18
+      }
+    ]
+  },
+  "top_note_modes": [
+    {
+      "id": "tnm_lyrical",
+      "mode_name": "lyrical",
+      "preferred_targets_by_function": {
+        "tonic": [
+          "3",
+          "7",
+          "9"
+        ],
+        "predominant": [
+          "11",
+          "b3",
+          "9"
+        ],
+        "dominant": [
+          "b9",
+          "3",
+          "b7",
+          "13"
+        ]
+      },
+      "motion_bias": "stepwise",
+      "leap_penalty": 0.7
+    },
+    {
+      "id": "tnm_stable",
+      "mode_name": "stable",
+      "preferred_targets_by_function": {
+        "tonic": [
+          "3",
+          "7",
+          "5"
+        ],
+        "predominant": [
+          "b3",
+          "b7",
+          "11"
+        ],
+        "dominant": [
+          "3",
+          "b7",
+          "13"
+        ]
+      },
+      "motion_bias": "common_tone_or_stepwise",
+      "leap_penalty": 0.8
+    },
+    {
+      "id": "tnm_tension_peak",
+      "mode_name": "tension_peak",
+      "preferred_targets_by_function": {
+        "tonic": [
+          "9",
+          "7"
+        ],
+        "predominant": [
+          "11",
+          "9"
+        ],
+        "dominant": [
+          "b9",
+          "#9",
+          "b13",
+          "#11"
+        ]
+      },
+      "motion_bias": "controlled_contrast",
+      "leap_penalty": 0.5
+    }
+  ],
+  "candidate_interpretation_examples": [
+    {
+      "id": "ex_dm7_vs_dm9_arpeggio",
+      "description": "In arpeggio context, a brief E over D-F-A should not automatically force structural Dm9.",
+      "input_context": {
+        "structural_pitch_center": [
+          "D",
+          "F",
+          "A",
+          "C"
+        ],
+        "surface_note": "E",
+        "texture": "arpeggio"
+      },
+      "preferred_output": {
+        "structural_chord": "Dm7",
+        "surface_extensions": [
+          "9"
+        ],
+        "alternate_candidate": "Dm9",
+        "reason": "Surface color note present, but structural label should remain stable in simple accompaniment arpeggio unless E is metrically or durationally emphasized."
+      }
+    },
+    {
+      "id": "ex_fmaj9_over_a_vs_am7b13",
+      "description": "Same pitch collection may admit multiple labels. Prefer the more complete/contextually stable label.",
+      "input_pitch_collection": [
+        "F",
+        "A",
+        "C",
+        "E",
+        "G"
+      ],
+      "candidate_chords": [
+        {
+          "label": "Fmaj9/A",
+          "score_bias": 0.91,
+          "reasons": [
+            "Complete Fmaj9 pitch collection present",
+            "Slash chord over A is common and readable",
+            "Phrase context may favor F-centered interpretation"
+          ]
+        },
+        {
+          "label": "Am7(b13)",
+          "score_bias": 0.74,
+          "reasons": [
+            "A-C-E-G present and F can function as b13",
+            "Valid alternate interpretation",
+            "Less preferred as primary label if surrounding harmony suggests F-major center"
+          ]
+        }
+      ],
+      "selected_label_policy": "Return both, choose one with higher context-weighted score."
+    },
+    {
+      "id": "ex_dsharpm7_after_Asharp7_with_enharmonic_approach",
+      "description": "After a clearly established A#7/Bb7-like dominant sonority, a following D#m7 target should remain primary even if MIDI contains an F natural that could reflect enharmonic spelling ambiguity or a chromatic approach to F#.",
+      "input_context": {
+        "previous_chord": "A#7_or_Bb7_pitchclass_view",
+        "target_skeleton": [
+          "D#",
+          "F#",
+          "A#",
+          "C#"
+        ],
+        "observed_ambiguous_pitch": "F",
+        "texture": "midi_event_based"
+      },
+      "preferred_output": {
+        "structural_chord": "D#m7",
+        "functional_label": "vi7_if_key_is_F#_major",
+        "surface_extensions": [
+          "possible enharmonic 9-color",
+          "chromatic approach to 3rd"
+        ],
+        "alternate_candidate": "D#m9",
+        "reason": "Functional context from the previous dominant and the presence of the D#m7 skeleton outweigh a single ambiguous MIDI pitch."
+      }
+    },
+    {
+      "id": "ex_secondary_dominant_respelling",
+      "description": "Raw MIDI pitch-classes may resemble Bb7, but in F# major context the musically preferable functional label can be A#7 = V7/vi if the chord resolves to D#m7.",
+      "input_context": {
+        "raw_pitch_classes": [
+          "A#",
+          "D",
+          "F",
+          "G#"
+        ],
+        "observed_literal_label_candidate": "Bb7",
+        "context_key": "F# major",
+        "next_chord": "D#m7"
+      },
+      "preferred_output": {
+        "selected_label": "A#7",
+        "functional_label": "V7/vi",
+        "alternate_candidate": "Bb7_literal_pitch_set_label",
+        "reason": "Functional respelling is preferred over literal pitch-set naming when secondary-dominant resolution is clear."
+      }
+    },
+    {
+      "id": "ex_borrowed_iv_in_major_not_secdom",
+      "description": "In a major-key ballad, an Fm or Fm6 moving to C may be better understood as borrowed iv color rather than any secondary-dominant chain.",
+      "input_context": {
+        "estimated_key": "C major",
+        "observed_progression": [
+          "C",
+          "Fm6",
+          "C/E"
+        ],
+        "style": "ballad_or_cinematic"
+      },
+      "preferred_output": {
+        "structural_chord": "Fm6",
+        "roman_numeral": "iv6",
+        "non_diatonic_family": "modal_interchange",
+        "reason": "Plagal-color pull and parallel-minor borrowing explain the sonority more musically than dominant reinterpretation."
+      }
+    },
+    {
+      "id": "ex_bvii_color_vs_secdom",
+      "description": "A bVII or bVII7 resolving to I may function as borrowed/backdoor/modal color; do not force secondary-dominant labeling unless dominant evidence is clearly stronger.",
+      "input_context": {
+        "estimated_key": "C major",
+        "observed_progression": [
+          "C",
+          "Bb7",
+          "C"
+        ],
+        "style": "pop_jazz_or_modal_pop"
+      },
+      "preferred_output": {
+        "structural_chord": "Bb7",
+        "roman_numeral": "bVII7_or_backdoor_family",
+        "non_diatonic_family": "borrowed_or_backdoor",
+        "reason": "The move is better captured as borrowed/backdoor color than as a generic secondary dominant."
+      }
+    },
+    {
+      "id": "ex_roman_function_for_Asharp7_to_Dsharpm7",
+      "description": "When MIDI pitch-classes suggest Bb7 but context resolves strongly to D#m7 in F# major, respell functionally as A#7 and emit roman numeral V7/vi.",
+      "input_context": {
+        "estimated_key": "F# major",
+        "observed_pitch_label": "Bb7",
+        "target": "D#m7"
+      },
+      "preferred_output": {
+        "structural_chord": "A#7",
+        "roman_numeral": "V7/vi",
+        "tonicization_target": "vi",
+        "non_diatonic_family": "secondary_dominant",
+        "reason": "Functional respelling plus roman numeral gives the musically useful interpretation."
+      }
+    },
+    {
+      "id": "ex_dmaj7_not_dmaj9_when_9_is_brief",
+      "description": "A strong maj7 with only a later brief off-beat 9 should remain Dmaj7, not Dmaj9.",
+      "input_context": {
+        "structural_pitch_center": [
+          "D",
+          "F#",
+          "A"
+        ],
+        "strong_extension": "C#",
+        "brief_late_surface_note": "E",
+        "texture": "midi_event_based"
+      },
+      "preferred_output": {
+        "structural_chord": "Dmaj7",
+        "surface_extensions": [
+          "9"
+        ],
+        "alternate_candidate": "Dmaj9",
+        "reason": "The maj7 independently qualifies for promotion, but the 9 does not."
+      }
+    },
+    {
+      "id": "ex_humanized_boundary_overlap_not_immediate_relabel",
+      "description": "In a humanized non-quantized MIDI performance, a note from the next harmony that enters slightly early should not automatically force a relabel of the current bar.",
+      "input_context": {
+        "current_bar_sonority": [
+          "A",
+          "C",
+          "Eb"
+        ],
+        "current_bass": "C",
+        "late_boundary_note": "B",
+        "timing_style": "humanized_performance_midi"
+      },
+      "preferred_output": {
+        "structural_chord": "A°/C",
+        "surface_or_transition_tag": "B as anticipation/pickup",
+        "alternate_candidate": "B7(b9)",
+        "reason": "The late boundary note lacks enough metrical and durational control to take over the current bar."
+      }
+    },
+    {
+      "id": "ex_bass_must_remain_visible_in_selected_label",
+      "description": "If the upper structure resembles a diminished chord but the actual bass is different, the selected label must keep the bass visible.",
+      "input_context": {
+        "sounding_bass": "E",
+        "upper_structure": [
+          "F",
+          "Ab",
+          "B",
+          "D"
+        ],
+        "timing_style": "humanized_performance_midi"
+      },
+      "preferred_output": {
+        "forbidden_selected_label": "F°",
+        "allowed_selected_labels": [
+          "F°/E",
+          "E7(b9)"
+        ],
+        "reason": "Upper-structure recognition does not license removal of the actual bass from the final label."
+      }
+    },
+    {
+      "id": "ex_bass_passing_motion_not_new_root",
+      "description": "A brief bass passing tone inside a stable slash chord should not automatically create a new harmonic label.",
+      "input_context": {
+        "ongoing_structure": [
+          "G",
+          "B",
+          "D"
+        ],
+        "sounding_bass": "B",
+        "brief_bass_motion": "F",
+        "upper_arpeggio": [
+          "G",
+          "D",
+          "G",
+          "B"
+        ],
+        "timing_style": "humanized_performance_midi"
+      },
+      "preferred_output": {
+        "selected_label": "G/B",
+        "surface_or_transition_tag": "F as bass passing motion",
+        "forbidden_primary_label": "F°",
+        "reason": "The stable G/B skeleton and duration occupancy outweigh the fleeting bass motion."
+      }
+    },
+    {
+      "id": "ex_shell_voicing_contextual_E7",
+      "description": "A realistic performance voicing may omit several core tones while still clearly functioning as E7 from bass and context.",
+      "input_context": {
+        "previous_harmony": "Bm7_or_related_preparation",
+        "current_slice": [
+          "E",
+          "G#"
+        ],
+        "next_harmony": "Am_or_Am7",
+        "texture": "real_performance_shell_voicing"
+      },
+      "preferred_output": {
+        "selected_label": "E7",
+        "partial_voicing_status": "incomplete_shell_voicing",
+        "reason": "Bass plus guide-tone identity and resolution behavior recover the dominant function even though the local slice is sparse."
+      }
+    },
+    {
+      "id": "ex_single_B_over_E_contextual_E7",
+      "description": "Even a very sparse slice such as bass E plus upper B can still be interpreted contextually, but with reduced confidence.",
+      "input_context": {
+        "current_slice": [
+          "E",
+          "B"
+        ],
+        "surrounding_context": "dominant_preparation_and_expected_resolution",
+        "texture": "sparse_real_performance"
+      },
+      "preferred_output": {
+        "selected_label": "E7_or_E5_context_dependent",
+        "confidence_policy": "reduce_confidence_but_do_not_auto_ban",
+        "reason": "Insufficient local completeness alone should not force rejection; keep confidence lower and rely on context."
+      }
+    },
+    {
+      "id": "ex_observed_pitch_set_blocks_wrong_functional_jump",
+      "description": "If the sounding structural tones already strongly identify a bass-aware dominant-b9 sonority, do not jump to an unrelated prettier functional label.",
+      "input_context": {
+        "sounding_bass": "E",
+        "observed_structural_tones": [
+          "E",
+          "F",
+          "G#",
+          "B",
+          "D"
+        ],
+        "texture": "performance_midi"
+      },
+      "preferred_output": {
+        "selected_label": "E7(b9)",
+        "upper_structure_label": "Fdim7/E",
+        "forbidden_primary_labels": [
+          "C7/E",
+          "F°"
+        ],
+        "reason": "The observed pitch-set already contains enough evidence for the bass-aware dominant-b9 reading."
+      }
+    },
+    {
+      "id": "ex_within_bar_split_explicit_tension_dominant",
+      "description": "When a humanized bar contains two clearly supported local sonorities, do not merge them into one broad dominant label; keep the explicitly supported tensions of each local sonority.",
+      "input_context": {
+        "first_local_sonority": [
+          "E",
+          "G#",
+          "B",
+          "D",
+          "F"
+        ],
+        "second_local_sonority": [
+          "Bb",
+          "C",
+          "E",
+          "G"
+        ],
+        "next_harmony": "Am11",
+        "timing_style": "humanized_performance_midi"
+      },
+      "preferred_output": {
+        "selected_labels": [
+          "E7(b9)",
+          "C7/Bb",
+          "Am11"
+        ],
+        "forbidden_primary_label": "single_merged_dominant_label_for_entire_region",
+        "reason": "The first sonority already specifically supports E7(b9), and the later Bb bass with C-E-G forms a new local dominant sonority. Keep both local harmonies instead of collapsing the passage into one broad dominant name."
+      }
+    },
+    {
+      "id": "ex_upper_structure_reorganization_requires_harmonic_interpretability",
+      "description": "Moving upper notes should not be promoted to a new chord unless the new upper sonority is itself chord-like and supported by bass/progression context.",
+      "input_context": {
+        "previous_harmony": "C",
+        "same_bass_continues": true,
+        "upper_motion": [
+          "A",
+          "G",
+          "E"
+        ],
+        "texture": "accompaniment_with_melody"
+      },
+      "preferred_output": {
+        "selected_label": "C",
+        "surface_or_transition_tag": "upper notes treated as melody over stable harmony",
+        "reason": "Upper-note motion alone is not enough; no new harmonically interpretable local sonority with new bass/progression support is established."
+      }
+    }
+  ],
+  "analysis_pipeline": {
+    "goal": "Analyze MIDI using rule DB and return chord identification, inversion analysis, melody/top-note fit, playability, voice-leading quality, and rule compliance.",
+    "steps": [
+      "Parse MIDI note events, tempo, time signature, tracks.",
+      "After parsing MIDI events, do not assume the metadata time signature is correct. Perform onset-pattern meter verification before splitting into analysis windows.",
+      "Meter verification procedure: (a) Collect all note-onset ticks. (b) Compute inter-onset intervals (IOIs) and find the dominant subdivision unit (typically the shortest frequently recurring IOI, e.g. eighth-note level). (c) Build a beat-position histogram by mapping onsets to positions within candidate grouping cycles (2-group for 2/4 or 6/8-as-2, 3-group for 3/4 or 9/8-as-3, 4-group for 4/4, 6-group for 6/8, etc.). (d) Evaluate accent strength at each histogram position using velocity, bass onsets, and note density. (e) Compare the accent profile against known meter templates and select the best-fit meter.",
+      "Meter template matching heuristics: 6/8 signature = strong accent every 3 eighth-notes with two-group hypermeter (onset peaks at positions 0 and 3 in a 6-slot cycle, bass typically on 0); 3/4 signature = strong accent every 3 quarter-notes (onset peaks at 0, may have secondary accent at 1 or 2); 4/4 signature = strong accent every 4 quarter-notes (peaks at 0 and 2); 12/8 or compound quadruple = strong every 3 eighth-notes with four-group hypermeter. If the best-fit meter differs from the MIDI metadata, override the metadata and log the discrepancy as a warning in the output.",
+      "When meter is determined to be compound (6/8, 9/8, 12/8), adjust all subsequent analysis windows to use dotted-quarter-note or dotted-beat boundaries instead of quarter-note boundaries. Beat strength mapping must reflect compound meter hierarchy: in 6/8 the dotted-quarter (3 eighth-notes) is the primary beat, not the quarter-note.",
+      "Split into analysis windows (bar, half-bar, beat, or event-based).",
+      "Estimate whether the MIDI is tightly quantized or humanized; if humanized, apply boundary-timing tolerance before declaring chord changes.",
+      "Merge or soften micro-overlaps around beat/bar boundaries so slight anticipations and delayed releases are first tested as expressive timing rather than immediate harmonic replacement.",
+      "Separate upper-structure recognition from final selected-label output: first detect possible diminished, tension-heavy, or quartal upper clusters, then choose a bass-aware slash or functionally reinterpreted label.",
+      "Before declaring a new root, test whether newly appearing bass notes are better explained as melodic bass motion, passing tones, line cliché, or arpeggio traversal within the current harmony.",
+      "If a new bass persists and the upper structure also re-centers, split the window into separate local harmonic events even inside a single bar; do not let anti-oversegmentation rules erase a real chord change.",
+      "When a dominant sonority is detected, prefer the most specific explicitly supported label (for example 7(b9)) and do not retreat to a generic catch-all dominant label.",
+      "Measure duration occupancy for bass notes and chord skeleton tones so long-held notes count as stronger structural evidence than brief notes.",
+      "Estimate melody track or melody note if melody track is provided.",
+      "Estimate bass, top note, and left/right hand distribution.",
+      "Generate chord candidates per window.",
+      "Score candidates using structural weighting, chord completeness, bass fit, context, melody relation, and rule DB.",
+      "After collecting notes for a window, separate literal sounding pitch-set evidence from contextual functional inference; do not skip the literal evidence check.",
+      "Detect whether the local slice is a complete chord, shell voicing, rootless voicing, upper-structure fragment, or incomplete performance fragment before final labeling.",
+      "Before finalizing the selected label, run an observed-pitch conflict check so functional reinterpretation does not erase clearly sounding structural tones.",
+      "When useful, emit three layers separately: literal sounding set, upper-structure/partial-voicing interpretation, and final bass-aware selected label.",
+      "Select primary chord plus alternate candidates.",
+      "Evaluate voicing, inversion, top note, voice leading, tension validity, avoid tones, and playability.",
+      "Return overall report with bar/segment diagnostics and suggestions.",
+      "Estimate key center and local tonicization candidates before final functional labeling.",
+      "For each winning chord candidate, derive roman numeral, scale-degree root, and non-diatonic family (diatonic, borrowed, secondary dominant, tritone-sub, passing diminished, chromatic-planing, pedal/sus, color-chord).",
+      "Compare non-diatonic interpretations broadly; do not collapse every outside chord into secondary dominant if borrowed/color explanations fit better.",
+      "Apply enharmonic ambiguity handling: compare pitch-classes first, then determine final spellings from key center, functional resolution, and readability.",
+      "If melody-aware voicing mode is requested, rank voicing templates by melody protection, style fit, playability, and voice-leading quality."
+    ]
+  },
+  "scoring_model": {
+    "description": "Suggested weighted score components for each candidate and final report.",
+    "components": [
+      {
+        "name": "harmonic_fit",
+        "weight": 0.21
+      },
+      {
+        "name": "structural_label_stability",
+        "weight": 0.1
+      },
+      {
+        "name": "timing_boundary_stability",
+        "weight": 0.04
+      },
+      {
+        "name": "duration_occupancy",
+        "weight": 0.05
+      },
+      {
+        "name": "melody_support",
+        "weight": 0.15
+      },
+      {
+        "name": "bass_motion_coherence",
+        "weight": 0.04
+      },
+      {
+        "name": "playability",
+        "weight": 0.12
+      },
+      {
+        "name": "voice_leading",
+        "weight": 0.12
+      },
+      {
+        "name": "inversion_suitability",
+        "weight": 0.06
+      },
+      {
+        "name": "contextual_progression_fit",
+        "weight": 0.05
+      },
+      {
+        "name": "functional_resolution_fit",
+        "weight": 0.05
+      },
+      {
+        "name": "style_voicing_fit",
+        "weight": 0.04
+      },
+      {
+        "name": "roman_numeral_clarity",
+        "weight": 0.04
+      },
+      {
+        "name": "non_diatonic_option_breadth",
+        "weight": 0.03
+      }
+    ],
+    "notes": [
+      "Hard-constraint violations should reject a candidate or apply a near-fatal penalty.",
+      "Soft constraints should rank otherwise valid candidates.",
+      "Structural label stability should favor musically readable labels over overfitted pitch-set labels.",
+      "When a dominant-resolution path is strongly supported, reduce penalty for a single ambiguous chromatic pitch if the destination chord skeleton is otherwise clear.",
+      "Enharmonic spelling confidence should be tracked separately from harmonic-fit confidence.",
+      "If melody-aware voicing selection is enabled, preferred voicing templates should be ranked by melody support, playability, and style fit.",
+      "Non-diatonic harmony should be evaluated across borrowed, secondary-dominant, tritone-sub, passing-diminished, planing, pedal/sus, and color-chord families before final labeling.",
+      "In humanized performance MIDI, timing-boundary stability should reward analyses that resist unnecessary relabeling from slight anticipations, overlaps, or delayed releases until the new harmony is structurally confirmed.",
+      "Duration occupancy should reward analyses supported by long-held bass notes and sustained chord skeleton tones, especially in non-quantized legato MIDI.",
+      "Bass-motion coherence should reward analyses that correctly distinguish true root changes from melodic bass movement, line clichés, and passing bass notes.",
+      "Upper-structure recognition must be scored separately from final selected-label correctness so diminished or tension-heavy clusters do not erase the sounding bass in the final label.",
+      "Incomplete voicings should usually incur a confidence penalty rather than a hard rejection; contextual recovery and local resolution evidence may restore the winning label.",
+      "Observed-pitch-set integrity must be checked separately from contextual prettiness so the analyzer does not invent unsupported chord tones or ignore clearly sounding structural tones.",
+      "When a literal upper structure and a functional bass-aware interpretation differ, preserve both internally and score final-label correctness by whether the sounding bass remains visible or functionally accounted for."
+    ]
+  },
+  "input_schema": {
+    "midi_file": "required",
+    "melody_track_index": "optional but strongly recommended",
+    "analysis_window_mode": [
+      "bar",
+      "half_bar",
+      "beat",
+      "event_based"
+    ],
+    "style_hint": [
+      "ballad",
+      "jazz",
+      "pop_jazz",
+      "modern_jazz",
+      "latin_jazz",
+      "new_age",
+      "pop_ballad"
+    ],
+    "top_note_mode": [
+      "lyrical",
+      "stable",
+      "tension_peak"
+    ],
+    "advanced_playability_mode": [
+      true,
+      false
+    ],
+    "timing_interpretation_mode": [
+      "auto",
+      "strict_quantized",
+      "humanized_tolerant"
+    ],
+    "meter_override_mode": [
+      "auto_detect",
+      "trust_metadata",
+      "force_6_8",
+      "force_3_4",
+      "force_4_4",
+      "force_12_8"
+    ]
+  },
+  "output_schema": {
+    "file_id": "string",
+    "estimated_key_center": "string_or_null",
+    "overall_scores": {
+      "harmonic_fit": "0_to_1",
+      "melody_support": "0_to_1",
+      "playability": "0_to_1",
+      "voice_leading": "0_to_1",
+      "overall": "0_to_1"
+    },
+    "segments": [
+      {
+        "segment_index": "integer",
+        "range_ticks": [
+          "start",
+          "end"
+        ],
+        "selected_label": "string",
+        "alternate_candidates": [
+          {
+            "label": "string",
+            "score": "0_to_1",
+            "reasons": [
+              "string"
+            ]
+          }
+        ],
+        "structural_chord": "string",
+        "surface_extensions": [
+          "string"
+        ],
+        "estimated_inversion": "string_or_null",
+        "detected_top_note": "string_or_null",
+        "melody_note": "string_or_null",
+        "scores": {
+          "harmonic_fit": "0_to_1",
+          "melody_support": "0_to_1",
+          "playability": "0_to_1",
+          "voice_leading": "0_to_1"
+        },
+        "issues": [
+          {
+            "type": "string",
+            "severity": "low_medium_high",
+            "description": "string"
+          }
+        ],
+        "suggestions": [
+          {
+            "action": "string",
+            "reason": "string"
+          }
+        ],
+        "functional_label": "string_or_null",
+        "spelling_confidence": "0_to_1_or_null",
+        "ambiguous_spelling_flag": "boolean",
+        "recommended_voicing_template": "string_or_null",
+        "roman_numeral": "string_or_null",
+        "scale_degree_root": "string_or_null",
+        "tonicization_target": "string_or_null",
+        "non_diatonic_family": "string_or_null",
+        "alternate_roman_numerals": [
+          {
+            "label": "string",
+            "score": "0_to_1",
+            "reasons": [
+              "string"
+            ]
+          }
+        ],
+        "literal_pitch_collection": [
+          "string"
+        ],
+        "sounding_bass": "string_or_null",
+        "upper_structure_label": "string_or_null",
+        "partial_voicing_status": "complete_or_shell_or_rootless_or_fragment_or_null",
+        "functional_confidence": "0_to_1_or_null"
+      }
+    ],
+    "meter_verification_result": {
+      "metadata_meter": "string (e.g. '4/4')",
+      "detected_meter": "string (e.g. '6/8')",
+      "detection_confidence": "float 0-1",
+      "meter_used_for_analysis": "string",
+      "override_applied": "boolean",
+      "evidence_summary": "string describing key signals"
+    }
+  },
+  "developer_notes": [
+    "Start with a rule-based analyzer first; add ML/AI later as a contextual assistant, not as the only judge.",
+    "Treat melody as top-priority when melody track exists.",
+    "Return primary and alternate chord labels rather than pretending ambiguity does not exist.",
+    "Separate structural harmony and surface-note interpretation in both internals and output.",
+    "For accompaniment analysis, avoid overreacting to every passing/arpeggiated color tone.",
+    "This JSON is intended as a starting spec; weights should be tuned empirically on real MIDI examples.",
+    "Add explicit enharmonic-respelling logic because MIDI pitch-classes do not preserve true spellings.",
+    "Treat secondary dominants functionally first, then assign the most readable enharmonic chord label for the current key context.",
+    "Expand this spec toward melody-aware voicing recommendation, not only chord identification.",
+    "Maintain a gold test set of real MIDI excerpts and regress every rule change against it.",
+    "Do not let the system develop a reflex where every non-diatonic sonority becomes a secondary dominant; maintain broad comparison across borrowed/modal/color families.",
+    "Emit roman numeral, scale-degree root, tonicization target, and non-diatonic family separately from literal chord name.",
+    "When user asks for a fresh outside chord, the engine should search across multiple non-diatonic strategies rather than defaulting to V7/x.",
+    "Evaluate structural extensions per tone, not as a bundle: a structural maj7 does not automatically imply structural 9, 11, or 13.",
+    "Distinguish humanized performance timing from structural harmonic timing; slight early/late notes near boundaries should be tested as anticipation or overlap before relabeling harmony.",
+    "Maintain test cases with non-quantized human MIDI so the analyzer does not confuse expressive timing with real mid-bar chord changes.",
+    "Maintain test cases where note length itself encodes sustain; the analyzer should treat long-duration occupancy as structural evidence rather than flattening everything into simultaneous pitch-class sets.",
+    "Do not let brief melodic bass motion or arpeggiated traversal create a new primary chord unless duration and supporting tones confirm a true harmonic takeover.",
+    "Upper-structure analysis is not the same as final labeling: if the bass is E, a detected F-diminished upper structure cannot be emitted as bare F°.",
+    "Do not convert missing core tones into a hard ban. Real performance MIDI often uses shell voicings, omitted fifths, and sparse right-hand fragments that still imply clear harmony from context.",
+    "But contextual recovery of omitted tones is not permission to ignore the actual sounding pitch-set; check for strong observed-tone conflicts before finalizing a prettier functional label.",
+    "Maintain test cases for sparse but valid dominant shells (for example bass E with G# only, or bass E with B only) so the analyzer learns confidence reduction instead of false rejection.",
+    "Maintain explicit regression tests for upper diminished structures over a different bass (for example F° over E) so the analyzer outputs a bass-aware label such as E7(b9) or F°/E, never bare F°.",
+    "Maintain regression tests for bars containing two real harmonic arrivals under humanized timing so the analyzer does not flatten mid-bar chord changes into a single merged label.",
+    "If a later sonority in the same bar gains its own bass support and upper-structure identity, preserve that second harmonic center explicitly instead of treating it as mere overlap from the previous chord.",
+    "Do not emit a generic catch-all dominant label as a final chord label. For dominant sonorities, write only the structurally supported tensions explicitly, such as 7(b9), 7(#9), 7(b13), 7(#11), or supported combinations.",
+    "Upper-structure reorganization should be granted only when the new upper sonority is genuinely harmonically interpretable; mere melodic motion above a stable bass must not be mistaken for a new chord.",
+    "When bass change, interpretable upper-sonority change, and surrounding progression logic align, prefer an explicit local chord change even inside one bar.",
+    "Practical labeling is a readability preference, not a license to erase heard harmonic identity.",
+    "Many DAWs (Logic Pro, Ableton, FL Studio, etc.) export MIDI with default 4/4 time signature even when the actual project uses a different meter. The meter_verification system was added to catch this common problem before it corrupts all downstream harmonic segmentation.",
+    "Meter detection should run BEFORE harmonic window splitting. Getting the meter wrong means every segment boundary is wrong, which cascades into wrong pitch collections per segment, wrong bass identification, and ultimately wrong chord labels. This is a foundational step."
+  ],
+  "enharmonic_interpretation_rules": {
+    "description": "MIDI loses true enharmonic spelling, so analysis should compare pitch-class input first and assign final note names from harmonic context, key center, and resolution direction.",
+    "rules": [
+      {
+        "id": "eh_pitch_class_first",
+        "description": "Treat pitches like E# and F, B and Cb, A# and Bb, C# and Db as the same pitch-class at input time. Do not trust literal note spelling from MIDI as final harmonic spelling.",
+        "input_policy": {
+          "compare_by_pitch_class_first": true,
+          "preserve_literal_note_name_from_midi": false
+        }
+      },
+      {
+        "id": "eh_contextual_respelling",
+        "description": "Choose the final enharmonic spelling from surrounding key center, structural chord function, and expected resolution. Prefer musically readable spellings such as A#7 for V7/vi in F# major even if raw MIDI pitch-classes resemble Bb7.",
+        "output_policy": {
+          "choose_spelling_from_key_center": true,
+          "choose_spelling_from_chord_function": true,
+          "allow_ambiguous_spelling_flag": true
+        }
+      },
+      {
+        "id": "eh_single_note_tolerance",
+        "description": "A single chromatic pitch that can be explained as enharmonic respelling, passing tone, or approach tone should not automatically overturn a structurally well-supported chord candidate.",
+        "conditions": [
+          "previous_or_next_chord_strongly_supports_functional_resolution",
+          "structural_chord_skeleton_is_present",
+          "ambiguous_pitch_is_short_or_weakly_accented_or_resolves_stepwise"
+        ],
+        "preferred_action": [
+          "keep_structural_label_stable",
+          "mark_note_as_surface_note_or_chromatic_approach",
+          "add_alternate_candidate_only_if_needed"
+        ]
+      }
+    ]
+  },
+  "melody_voicing_rules": {
+    "description": "Rules for selecting or generating piano voicings when a melody note is given. These rules extend harmony analysis into melody-constrained voicing recommendation.",
+    "rules": [
+      {
+        "id": "mvr_top_note_alignment",
+        "description": "If melody note is a chord tone or stable tension, prefer voicings that keep the melody as the top note or place the accompaniment top note safely below it.",
+        "preferred_when_melody_role": [
+          "root",
+          "3",
+          "5",
+          "7",
+          "9",
+          "11_contextual",
+          "13_contextual"
+        ],
+        "score_boost": 0.25
+      },
+      {
+        "id": "mvr_nonchord_melody_support",
+        "description": "If melody is a passing, neighbor, or suspension tone, accompaniment should prioritize stable guide tones and avoid competing chromatic color on top.",
+        "preferred_accompaniment_degrees": [
+          "3",
+          "7",
+          "1",
+          "5"
+        ],
+        "penalize_competing_top_chromaticism": true,
+        "score_boost": 0.2
+      },
+      {
+        "id": "mvr_lh_foundation_choice",
+        "description": "For piano accompaniment, choose left-hand foundation by style and density: root+5 or root+10 for ballad/pop, shell/rootless variants for jazz where context is clear.",
+        "style_preferences": {
+          "ballad": [
+            "root_5",
+            "root_10"
+          ],
+          "jazz": [
+            "shell",
+            "rootless_A"
+          ],
+          "pop_jazz": [
+            "root_5",
+            "shell"
+          ],
+          "modern_jazz": [
+            "rootless_A",
+            "shell",
+            "explicit_tension_compact"
+          ]
+        }
+      },
+      {
+        "id": "mvr_voice_leading_between_chords",
+        "description": "Prefer common-tone retention and stepwise top-note motion between adjacent voicings. Resolve dominant 7ths and explicitly named dominant tensions with clear direction when possible.",
+        "preferred_top_motion": [
+          "hold",
+          "step_up",
+          "step_down"
+        ],
+        "discouraged_top_motion": [
+          "tritone_leap",
+          "octave_leap_without_reason"
+        ],
+        "score_boost": 0.2
+      },
+      {
+        "id": "mvr_style_dependent_tension_policy",
+        "description": "Permit or restrict upper tensions according to style. Ballad favors supportive color; jazz/modern_jazz may use denser explicit-tension or rootless shapes.",
+        "style_tension_preferences": {
+          "ballad": [
+            "9",
+            "6",
+            "13_contextual"
+          ],
+          "jazz": [
+            "9",
+            "11_contextual",
+            "13",
+            "b9_contextual",
+            "#11_contextual"
+          ],
+          "pop_jazz": [
+            "9",
+            "13_contextual",
+            "sus4_contextual"
+          ],
+          "modern_jazz": [
+            "9",
+            "11",
+            "#11",
+            "13",
+            "b9",
+            "#9",
+            "b13"
+          ]
+        }
+      }
+    ]
+  },
+  "roman_numeral_interpretation_rules": {
+    "description": "Convert absolute chord interpretations into roman-numeral / degree labels from estimated key center and local tonicization. Keep this separate from literal chord spelling. Non-diatonic harmony should be classified across multiple families before defaulting to secondary dominant.",
+    "workflow": [
+      "Estimate global key center, then allow local tonicization or temporary local center when contextual evidence is strong.",
+      "Map chord root to scale degree relative to estimated key center or local tonicized center.",
+      "Determine whether the chord is diatonic, borrowed/modal-interchange, secondary dominant, tritone substitution, chromatic passing, suspended dominant, pedal-harmony, or other non-diatonic color.",
+      "Do not derive roman numerals until after bass-aware selected labeling is settled; upper-structure labels and literal fragments should not be mistaken for the final functional root.",
+      "Emit literal chord label and roman numeral separately.",
+      "If multiple readings remain plausible, keep primary and alternate roman numerals rather than collapsing everything into a dominant interpretation."
+    ],
+    "major_key_mapping_reference": {
+      "1": "I",
+      "2": "ii",
+      "3": "iii",
+      "4": "IV",
+      "5": "V",
+      "6": "vi",
+      "7": "viiø"
+    },
+    "minor_key_mapping_reference": {
+      "1": "i",
+      "2": "iiø",
+      "3": "III",
+      "4": "iv",
+      "5": "v_or_V_contextual",
+      "6": "VI",
+      "7": "VII_or_vii°_contextual"
+    },
+    "non_diatonic_families": [
+      {
+        "family": "secondary_dominant",
+        "roman_examples": [
+          "V7/V",
+          "V7/vi",
+          "V/ii"
+        ],
+        "when_to_prefer": "Dominant-quality chord resolves convincingly to a local target chord whose arrival is supported by guide-tone motion and contextual cadence."
+      },
+      {
+        "family": "modal_interchange",
+        "roman_examples": [
+          "iv",
+          "bVI",
+          "bVII",
+          "bIII"
+        ],
+        "when_to_prefer": "Borrowed color from parallel mode is more convincing than dominant resolution, especially in pop/ballad/cinematic contexts."
+      },
+      {
+        "family": "tritone_substitution",
+        "roman_examples": [
+          "subV/V",
+          "subV/vi"
+        ],
+        "when_to_prefer": "Dominant substitute root lies tritone from expected dominant and preserves dominant-style resolution behavior."
+      },
+      {
+        "family": "chromatic_passing_or_planing",
+        "roman_examples": [
+          "chromatic_passing",
+          "planed_parallel"
+        ],
+        "when_to_prefer": "Chord mainly smooths bass/top-line motion and does not establish stable tonicization."
+      },
+      {
+        "family": "passing_diminished",
+        "roman_examples": [
+          "#I°7_between_I_ii",
+          "common_tone_dim"
+        ],
+        "when_to_prefer": "Diminished structure serves connective voice leading more than functional dominant purpose."
+      },
+      {
+        "family": "suspended_or_pedal_harmony",
+        "roman_examples": [
+          "Vsus",
+          "I_pedal_over_IV_color"
+        ],
+        "when_to_prefer": "Pedal or suspension explains the sonority more musically than forcing a new functional root."
+      },
+      {
+        "family": "color_chord_nonfunctional",
+        "roman_examples": [
+          "maj7#11_color",
+          "quartal_color_over_pedal"
+        ],
+        "when_to_prefer": "Style and texture suggest color sonority rather than classical-functional resolution."
+      }
+    ],
+    "decision_bias": {
+      "do_not_force_secondary_dominant_when_resolution_is_weak": true,
+      "prefer_borrowed_or_color_interpretation_if_style_supports_it": true,
+      "emit_alternate_roman_when_non_diatonic_family_is_ambiguous": true
+    }
+  }
+}
