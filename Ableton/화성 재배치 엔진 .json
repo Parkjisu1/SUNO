@@ -1,0 +1,885 @@
+{
+  "schema_version": 1.0,
+  "module_name": "Relative Representation & Rearrangement Engine",
+  "companion_to": "MIDI Harmony Analyzer Rule DB v1.8",
+  "purpose": "Converts harmony-analyzed MIDI notes into chord-relative representations for pattern storage, retrieval, and role-preserving rearrangement onto new chord progressions. This module sits between the Harmony Analysis Engine (upstream) and the MIDI Generation/Export module (downstream), enabling the core PRD workflow: analyze → extract relative pattern → store → retrieve → remap to user-specified chords → output MIDI.",
+
+  "design_philosophy": {
+    "summary": [
+      "Every note is stored not as an absolute MIDI pitch but as a role within its originating chord context.",
+      "The relative representation must be lossless enough to reconstruct the original absolute pitches given the original chord, while being flexible enough to remap onto any target chord.",
+      "Rhythm, velocity, duration, and articulation travel with each note as first-class properties, not afterthoughts.",
+      "Rearrangement is role-preserving: a note that was the 3rd of Cmaj7 becomes the 3rd of whatever the target chord is.",
+      "Simple transposition is a degenerate case of rearrangement, not the default behavior.",
+      "The engine must respect the analysis engine's distinction between structural tones and surface tones during rearrangement.",
+      "Surface tones (passing, neighbor, approach, ornament) follow their own rearrangement logic that preserves melodic contour and intervallic relationship to surrounding structural tones.",
+      "Bass notes receive special handling because bass voice-leading has different rules from upper-voice rearrangement.",
+      "The rearrangement engine inherits all hard constraints from the companion harmony analyzer, especially playability, register, and melody protection.",
+      "When ambiguity exists in how to remap a note, prefer the option that preserves voice-leading smoothness and avoids forbidden intervals.",
+      "Rearrangement must never silently drop notes; if a note cannot be cleanly remapped, flag it for review rather than deleting it.",
+      "The system must handle chord quality changes gracefully: remapping from maj7 to m7 requires intelligent degree adjustment, not blind interval copying."
+    ],
+    "relationship_to_analysis_engine": {
+      "input_dependency": "This module consumes the output_schema of the Harmony Analyzer, specifically: selected_label, structural_chord, surface_extensions, note role tags, sounding_bass, roman_numeral, and partial_voicing_status.",
+      "shared_rules": "Hard constraints (hc_*), playability_constraints, and chord_quality_rules from the analysis engine are reused during rearrangement validation.",
+      "no_duplication": "This module does not re-specify chord tone definitions, avoid tones, or voicing templates already defined in the analysis engine. It references them by id."
+    }
+  },
+
+  "relative_note_representation": {
+    "description": "Schema for representing a single MIDI note in chord-relative terms. This is the atomic unit stored in the Pattern DB.",
+    "note_schema": {
+      "chord_degree": {
+        "type": "string",
+        "description": "The note's role relative to the chord root. Uses the same degree vocabulary as the analysis engine's chord_quality_rules.",
+        "possible_values": [
+          "1", "b2", "2", "b3", "3", "4", "#4", "b5", "5", "#5", "b6", "6",
+          "b7", "7", "b9", "9", "#9", "11", "#11", "b13", "13"
+        ],
+        "examples": [
+          {"absolute_note": "E4", "chord": "Cmaj7", "chord_degree": "3"},
+          {"absolute_note": "Bb3", "chord": "Cm7", "chord_degree": "b7"},
+          {"absolute_note": "F#4", "chord": "D7", "chord_degree": "#11", "note_function": "tension"}
+        ]
+      },
+      "octave_offset": {
+        "type": "integer",
+        "description": "How many octaves above or below the chord root's reference octave this note sits. Reference octave is determined by the bass note's octave for bass-role notes, or by the voicing register center for upper-voice notes.",
+        "range": [-2, 3],
+        "examples": [
+          {"chord_degree": "3", "octave_offset": 0, "meaning": "3rd in the same octave region as root"},
+          {"chord_degree": "3", "octave_offset": 1, "meaning": "3rd one octave above root region (10th)"},
+          {"chord_degree": "1", "octave_offset": -1, "meaning": "root one octave below reference"}
+        ]
+      },
+      "note_function": {
+        "type": "string",
+        "description": "The functional role of this note, directly inheriting from the analysis engine's note role tagging. Determines rearrangement priority and method.",
+        "possible_values": [
+          "root", "chord_tone", "guide_tone", "tension",
+          "bass_anchor", "structural_tone",
+          "passing_tone", "neighbor_tone", "approach_tone",
+          "suspension", "pedal_tone", "ornament_tone",
+          "arpeggio_traversal", "melody_tone", "ghost_note"
+        ],
+        "rearrangement_priority": {
+          "structural": ["root", "chord_tone", "guide_tone", "bass_anchor", "structural_tone"],
+          "contextual": ["tension", "suspension", "pedal_tone", "melody_tone"],
+          "surface": ["passing_tone", "neighbor_tone", "approach_tone", "ornament_tone", "arpeggio_traversal", "ghost_note"]
+        }
+      },
+      "voice_assignment": {
+        "type": "string",
+        "description": "Which voice layer this note belongs to.",
+        "possible_values": ["bass", "left_hand_inner", "right_hand_inner", "top_voice", "melody"],
+        "rearrangement_note": "Bass voice follows bass-specific rearrangement rules. Top voice follows melody-protection rules. Inner voices prioritize minimal motion."
+      },
+      "rhythmic_position": {
+        "type": "object",
+        "description": "Position within the bar, independent of absolute tick position.",
+        "properties": {
+          "bar_number": {"type": "integer", "description": "Bar index within the pattern (0-based)."},
+          "beat": {"type": "number", "description": "Beat position within the bar (1-based, supports fractional for subdivisions). Example: 1.0 = beat 1, 2.5 = beat 2 and-of."},
+          "beat_strength": {
+            "type": "string",
+            "possible_values": ["downbeat", "strong_beat", "weak_beat", "off_beat", "subdivision", "pickup"],
+            "description": "Metric strength at this position, inherited from the meter verification of the analysis engine."
+          },
+          "humanize_offset_ticks": {
+            "type": "integer",
+            "description": "Original timing deviation from the quantized grid, preserved for humanization restoration during export.",
+            "default": 0
+          }
+        }
+      },
+      "duration": {
+        "type": "object",
+        "properties": {
+          "quantized_beats": {"type": "number", "description": "Duration in beats after quantization. Example: 1.0 = quarter note, 0.5 = eighth note."},
+          "original_duration_ticks": {"type": "integer", "description": "Raw MIDI duration for humanization restoration."},
+          "tie_to_next": {"type": "boolean", "default": false, "description": "Whether this note ties into the next chord segment."}
+        }
+      },
+      "velocity": {
+        "type": "object",
+        "properties": {
+          "absolute": {"type": "integer", "range": [0, 127], "description": "Original MIDI velocity."},
+          "relative_to_bar_average": {"type": "number", "description": "Velocity relative to the bar's average velocity. 1.0 = average, 1.3 = 30% louder."},
+          "accent_type": {
+            "type": "string",
+            "possible_values": ["none", "metric_accent", "agogic_accent", "dynamic_accent", "ghost"],
+            "default": "none"
+          }
+        }
+      },
+      "contour_context": {
+        "type": "object",
+        "description": "Relationship to immediately preceding and following notes in the same voice. Critical for preserving melodic contour during rearrangement.",
+        "properties": {
+          "interval_from_prev": {
+            "type": "integer_or_null",
+            "description": "Semitone interval from the previous note in the same voice. Null if first note."
+          },
+          "interval_to_next": {
+            "type": "integer_or_null",
+            "description": "Semitone interval to the next note in the same voice. Null if last note."
+          },
+          "direction_from_prev": {
+            "type": "string_or_null",
+            "possible_values": ["ascending", "descending", "unison", null]
+          },
+          "direction_to_next": {
+            "type": "string_or_null",
+            "possible_values": ["ascending", "descending", "unison", null]
+          }
+        }
+      }
+    },
+
+    "conversion_rules": {
+      "description": "Rules for converting an absolute MIDI note + analysis result into a relative note representation.",
+      "steps": [
+        "Receive the note's absolute MIDI pitch, the segment's selected_label and structural_chord from the analysis engine.",
+        "Determine the chord root pitch class from the selected_label.",
+        "Calculate the note's pitch class interval from the chord root (semitones mod 12).",
+        "Map the interval to the appropriate chord_degree using the chord_quality_rules from the analysis engine.",
+        "If the note is a chord tone of the structural_chord, assign the matching degree directly.",
+        "If the note is a surface_extension identified by the analysis engine, assign the tension degree and set note_function accordingly.",
+        "If the note was tagged as passing_tone, neighbor_tone, approach_tone, etc. by the analysis engine, preserve that tag and assign the degree that best describes its chromatic position relative to the chord root.",
+        "Calculate octave_offset by comparing the note's octave to the chord root's reference octave.",
+        "Preserve all rhythmic, velocity, and duration information from the original MIDI event.",
+        "Compute contour_context by examining adjacent notes in the same voice."
+      ],
+      "ambiguity_handling": {
+        "enharmonic": "Use the analysis engine's enharmonic_interpretation_rules to determine the correct degree spelling. For example, in a dom7 context, pitch class 10 above root is b7, not #6.",
+        "multi_function": "If a note could be interpreted as two different degrees (e.g., #9 vs b3 on a dominant chord), prefer the interpretation that matches the analysis engine's structural vs surface classification for that note.",
+        "cross_segment": "Notes that tie across chord boundaries get the degree of their onset chord, with tie_to_next = true."
+      }
+    }
+  },
+
+  "pattern_schema": {
+    "description": "Schema for a stored pattern unit. A pattern is a collection of relative notes grouped by phrase or measure, ready for retrieval and rearrangement.",
+    "pattern_unit": {
+      "pattern_id": "string (unique identifier)",
+      "source_midi_id": "string (reference to original MIDI file in DB)",
+      "source_segment_range": {
+        "start_bar": "integer",
+        "end_bar": "integer",
+        "description": "Which bars of the original MIDI this pattern was extracted from."
+      },
+      "originating_chord_sequence": {
+        "description": "The chord progression this pattern was originally played over, as analyzed by the harmony engine.",
+        "type": "array",
+        "items": {
+          "chord_label": "string (e.g., 'Dm7')",
+          "chord_quality_ref": "string (e.g., 'cq_m7', referencing analysis engine chord_quality_rules id)",
+          "roman_numeral": "string_or_null (e.g., 'ii7')",
+          "duration_beats": "number",
+          "bar_position": "integer"
+        }
+      },
+      "notes": {
+        "type": "array of relative_note_representation",
+        "description": "All notes in this pattern, in onset-time order, each in relative representation."
+      },
+      "metadata": {
+        "meter": "string (e.g., '4/4', '6/8')",
+        "tempo_bpm": "number",
+        "length_bars": "integer",
+        "length_beats": "number",
+        "style": "string (e.g., 'ballad', 'jazz', 'pop_jazz')",
+        "instrument_role": "string (e.g., 'piano_accompaniment', 'piano_solo', 'bass', 'strings')",
+        "density": {
+          "notes_per_beat_average": "number",
+          "category": "string (sparse | medium | dense)"
+        },
+        "register_profile": {
+          "lowest_midi": "integer",
+          "highest_midi": "integer",
+          "center_midi": "integer"
+        },
+        "voicing_style": {
+          "primary_template": "string_or_null (references voicing_templates id from analysis engine, e.g., 'vt_shell_root')",
+          "characteristics": ["string (e.g., 'rootless', 'spread', 'close_position', 'block', 'broken')"]
+        },
+        "rhythmic_profile": {
+          "dominant_subdivision": "string (e.g., 'eighth_note', 'triplet', 'sixteenth')",
+          "syncopation_level": "string (none | light | moderate | heavy)",
+          "pattern_type": "string (e.g., 'arpeggiated', 'block_chord', 'alberti', 'stride', 'comping', 'melodic_line', 'pad')"
+        },
+        "energy_profile": {
+          "start_velocity_avg": "integer",
+          "peak_velocity_avg": "integer",
+          "end_velocity_avg": "integer",
+          "trajectory": "string (flat | building | declining | arc | swell)"
+        },
+        "phrase_boundary": {
+          "starts_phrase": "boolean",
+          "ends_phrase": "boolean",
+          "phrase_type": "string_or_null (e.g., 'antecedent', 'consequent', 'turnaround', 'intro', 'ending')"
+        }
+      },
+      "structural_summary": {
+        "description": "High-level description of the pattern's harmonic movement, useful for retrieval matching.",
+        "chord_tone_density": "number (ratio of chord tones to total notes)",
+        "tension_density": "number (ratio of tension tones to total notes)",
+        "surface_tone_density": "number (ratio of surface/ornamental tones to total notes)",
+        "voice_count_typical": "integer (how many simultaneous voices)",
+        "bass_movement_type": "string (static | root_motion | walking | pedal | line_cliche)",
+        "top_voice_contour": "string (ascending | descending | arc | wave | static | stepwise)"
+      }
+    }
+  },
+
+  "rearrangement_engine": {
+    "description": "Rules and procedures for taking a stored relative pattern and mapping it onto a new chord progression specified by the user.",
+
+    "rearrangement_philosophy": [
+      "Rearrangement is not transposition. Each note's chord_degree and note_function determine how it maps to the new chord.",
+      "A 3rd in a major chord maps to the 3rd of the target chord, regardless of whether the target chord is major or minor — the target chord's quality defines what '3rd' means.",
+      "When the source and target chord qualities differ, intelligent degree translation is required.",
+      "The contour and rhythm of the pattern are preserved as closely as possible; only pitch content changes.",
+      "Register placement is guided by the target chord's context and the playability constraints from the analysis engine.",
+      "Voice-leading between adjacent chords in the target progression should be smooth, following the progression_resolution_rules from the analysis engine.",
+      "The rearrangement engine must validate every remapped note against the target chord's avoid_tones and the hard_constraints from the analysis engine."
+    ],
+
+    "core_rearrangement_pipeline": {
+      "steps": [
+        {
+          "step": 1,
+          "name": "parse_target_chord_progression",
+          "description": "Parse the user's input chord progression into a structured sequence of chord objects.",
+          "details": [
+            "Accept chord symbols (e.g., 'Dm7 - G7 - Cmaj7'), roman numerals (e.g., 'ii7 - V7 - Imaj7'), or hybrid notation.",
+            "For each chord, resolve: root pitch class, chord quality, extensions/tensions, bass note (if slash chord), duration in beats.",
+            "Look up the matching chord_quality_rules entry from the analysis engine.",
+            "If the user specifies a key, resolve roman numerals to absolute chord names."
+          ]
+        },
+        {
+          "step": 2,
+          "name": "align_pattern_to_target_progression",
+          "description": "Map the pattern's originating_chord_sequence to the target chord progression.",
+          "details": [
+            "If the pattern has N chords and the target has M chords, handle alignment:",
+            "N == M: direct 1-to-1 mapping.",
+            "N < M: the pattern must be extended or repeated. Use phrase_boundary metadata to find natural loop/extension points.",
+            "N > M: the pattern must be truncated. Prefer cutting at phrase boundaries.",
+            "For each chord slot, pair (source_chord, target_chord) for note-by-note rearrangement.",
+            "Handle duration differences: if source chord lasts 4 beats but target chord lasts 2 beats, compress the pattern's rhythm proportionally or truncate at a musically sensible point."
+          ]
+        },
+        {
+          "step": 3,
+          "name": "degree_translation",
+          "description": "For each note in the pattern, translate its chord_degree from the source chord context to the target chord context.",
+          "rules": [
+            {
+              "id": "rt_structural_tone_direct_map",
+              "description": "Structural tones (root, chord_tone, guide_tone, bass_anchor) map directly to the same degree in the target chord.",
+              "examples": [
+                {"source": "3rd of Cmaj7 (E)", "target_chord": "Abmaj7", "result": "3rd of Abmaj7 (C)"},
+                {"source": "b7 of Dm7 (C)", "target_chord": "Fm7", "result": "b7 of Fm7 (Eb)"},
+                {"source": "root of G7 (G)", "target_chord": "Bb7", "result": "root of Bb7 (Bb)"}
+              ]
+            },
+            {
+              "id": "rt_quality_change_adaptation",
+              "description": "When source and target chord qualities differ, the degree itself may need adaptation.",
+              "rules": [
+                {
+                  "scenario": "source_maj7_target_m7",
+                  "adaptation": {
+                    "3": "b3",
+                    "7": "b7",
+                    "other_degrees": "unchanged"
+                  },
+                  "description": "Major 3rd becomes minor 3rd; major 7th becomes minor 7th."
+                },
+                {
+                  "scenario": "source_m7_target_maj7",
+                  "adaptation": {
+                    "b3": "3",
+                    "b7": "7",
+                    "other_degrees": "unchanged"
+                  }
+                },
+                {
+                  "scenario": "source_m7_target_dom7",
+                  "adaptation": {
+                    "b3": "3",
+                    "b7": "b7",
+                    "other_degrees": "unchanged"
+                  },
+                  "description": "Minor 3rd becomes major 3rd; b7 stays as b7."
+                },
+                {
+                  "scenario": "source_maj7_target_dom7",
+                  "adaptation": {
+                    "3": "3",
+                    "7": "b7",
+                    "other_degrees": "unchanged"
+                  }
+                },
+                {
+                  "scenario": "source_dom7_target_m7",
+                  "adaptation": {
+                    "3": "b3",
+                    "b7": "b7",
+                    "other_degrees": "unchanged"
+                  }
+                },
+                {
+                  "scenario": "source_any_target_m7b5",
+                  "adaptation": {
+                    "3_or_b3": "b3",
+                    "5": "b5",
+                    "7_or_b7": "b7",
+                    "other_degrees": "consult_avoid_tones_of_target"
+                  }
+                },
+                {
+                  "scenario": "source_any_target_dim7",
+                  "adaptation": {
+                    "3_or_b3": "b3",
+                    "5": "b5",
+                    "7_or_b7": "bb7",
+                    "other_degrees": "consult_avoid_tones_of_target"
+                  }
+                },
+                {
+                  "scenario": "source_any_target_7sus",
+                  "adaptation": {
+                    "3_or_b3": "4",
+                    "b7": "b7",
+                    "other_degrees": "unchanged"
+                  },
+                  "description": "The 3rd role maps to sus4; b7 stays."
+                },
+                {
+                  "scenario": "source_any_target_aug",
+                  "adaptation": {
+                    "5": "#5",
+                    "other_degrees": "consult_avoid_tones_of_target"
+                  }
+                }
+              ],
+              "fallback": "If no specific adaptation rule exists, map the degree literally and then validate against the target chord's avoid_tones."
+            },
+            {
+              "id": "rt_tension_mapping",
+              "description": "Tension tones (9, #11, 13, b9, #9, b13) map by degree name when the target chord supports them. If the target chord's available_tensions does not include the source tension, apply tension_fallback_rules.",
+              "tension_fallback_rules": [
+                {
+                  "if_source_tension": "9",
+                  "target_lacks_9": "Replace with nearest available chord tone or approved tension. Prefer 1 (octave above) or keep 9 if target style permits.",
+                  "priority": ["9_if_style_allows", "1_octave_up", "b3_or_3"]
+                },
+                {
+                  "if_source_tension": "#11",
+                  "target_lacks_sharp11": "Replace with 5 or 11 depending on target chord quality and avoid_tones.",
+                  "priority": ["#11_if_style_allows", "5", "11_if_not_avoided"]
+                },
+                {
+                  "if_source_tension": "13",
+                  "target_lacks_13": "Replace with 5 or nearest approved tension.",
+                  "priority": ["13_if_style_allows", "5", "b13_if_dominant"]
+                },
+                {
+                  "if_source_tension": "b9",
+                  "target_lacks_b9": "Replace with 1 or 9 depending on target quality.",
+                  "priority": ["b9_if_dominant_target", "9", "1"]
+                },
+                {
+                  "if_source_tension": "#9",
+                  "target_lacks_sharp9": "Replace with b3 or 3 depending on target quality.",
+                  "priority": ["#9_if_dominant_target", "b3", "3"]
+                },
+                {
+                  "if_source_tension": "b13",
+                  "target_lacks_b13": "Replace with 5 or 13.",
+                  "priority": ["b13_if_dominant_target", "5", "13"]
+                }
+              ]
+            },
+            {
+              "id": "rt_surface_tone_rearrangement",
+              "description": "Surface tones (passing, neighbor, approach, ornament, arpeggio traversal) are remapped by preserving their intervallic relationship to the surrounding structural tones rather than by direct degree mapping.",
+              "rules": [
+                {
+                  "id": "rt_passing_tone",
+                  "description": "A passing tone fills a gap between two structural tones. After remapping the structural tones, place the passing tone chromatically or diatonically between them, preserving the original step type (chromatic vs diatonic).",
+                  "method": "Calculate the interval between the two remapped structural tones. If the original passing tone was chromatic (semitone step), insert a chromatic passing tone. If diatonic (whole step), insert a scale-appropriate passing tone based on the target chord's parent scale."
+                },
+                {
+                  "id": "rt_neighbor_tone",
+                  "description": "A neighbor tone sits a step above or below a structural tone and returns. Preserve the direction (upper/lower) and step size (half/whole) relative to the remapped structural tone.",
+                  "method": "Identify which structural tone it decorates. Remap the structural tone first. Apply the same neighbor direction and step type to the new position."
+                },
+                {
+                  "id": "rt_approach_tone",
+                  "description": "An approach tone leads into a structural tone by step or half-step. Preserve the approach direction and distance.",
+                  "method": "Remap the target structural tone first. Place the approach tone at the same intervallic distance below or above the new target."
+                },
+                {
+                  "id": "rt_ornament_tone",
+                  "description": "Ornamental tones (grace notes, turns, trills) preserve their intervallic relationship to the principal note.",
+                  "method": "Remap the principal note. Apply the same ornamental interval pattern."
+                },
+                {
+                  "id": "rt_arpeggio_traversal",
+                  "description": "Arpeggio traversal notes map to the target chord's available tones in the same ascending/descending order, preserving the contour shape.",
+                  "method": "Identify the arpeggio's degree sequence (e.g., 1-3-5-7). Map each degree to the target chord. If a degree doesn't exist in the target (e.g., 7 on a triad), substitute with the nearest available tone while preserving ascending/descending direction."
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "step": 4,
+          "name": "octave_and_register_placement",
+          "description": "Determine the absolute octave for each remapped note.",
+          "rules": [
+            {
+              "id": "rr_preserve_octave_offset",
+              "description": "Start by applying the same octave_offset from the relative representation to the target chord root's reference octave.",
+              "priority": "primary"
+            },
+            {
+              "id": "rr_register_boundary_check",
+              "description": "After initial placement, verify that every note falls within the playability_constraints from the analysis engine. If a note falls outside the allowed register, shift by octave in the direction that keeps it closest to the original octave_offset intent.",
+              "references": "playability_constraints.left_hand_midi_range, right_hand_midi_range, preferred_top_note_midi_range"
+            },
+            {
+              "id": "rr_bass_register_lock",
+              "description": "Bass notes (voice_assignment = 'bass') must stay within the bass register. If the target chord root is significantly higher or lower than the source chord root, adjust the bass octave to keep it in a musically sensible bass range.",
+              "bass_midi_range": [28, 55],
+              "preferred_bass_midi_range": [33, 50]
+            },
+            {
+              "id": "rr_top_note_register_guidance",
+              "description": "Top voice notes should stay within the preferred top-note range. If melody is present, the top voice must not exceed the melody pitch on strong beats (inheriting mar_avoid_minor9_clash from the analysis engine).",
+              "references": "playability_constraints.preferred_top_note_midi_range, melody_alignment_rules"
+            },
+            {
+              "id": "rr_voice_crossing_prevention",
+              "description": "After all notes are placed, verify that voices do not cross inappropriately. Bass must be below left_hand_inner; left_hand_inner must not exceed right_hand_inner; top_voice must remain on top.",
+              "exception": "Brief voice crossings in fast arpeggio contexts are tolerated."
+            },
+            {
+              "id": "rr_interval_root_distance_preservation",
+              "description": "When the source chord root and target chord root differ by a large interval (e.g., tritone or more), verify that the overall register shift doesn't create an unnatural sound. If the entire pattern shifts up by a 5th or more, consider shifting some voices down an octave to maintain comfortable register balance."
+            }
+          ]
+        },
+        {
+          "step": 5,
+          "name": "voice_leading_optimization",
+          "description": "Optimize voice leading between adjacent chords in the target progression.",
+          "rules": [
+            {
+              "id": "vl_common_tone_retention",
+              "description": "If a note's remapped pitch is the same as a note in the previous chord's remapping, prefer holding that common tone in the same voice.",
+              "references": "sc_common_tone_retention from analysis engine"
+            },
+            {
+              "id": "vl_guide_tone_resolution",
+              "description": "Guide tones (3rd and 7th) should follow the progression_resolution_rules from the analysis engine. For example, in a ii-V-I, the b7 of ii resolves down to the 3rd of V.",
+              "references": "progression_resolution_rules (pr_ii_V, pr_V_I, etc.)"
+            },
+            {
+              "id": "vl_minimize_total_motion",
+              "description": "Among all valid remappings, prefer the one that minimizes total semitone motion across all voices.",
+              "exception": "Bass movement follows harmonic rhythm, not minimal motion — bass typically moves to the chord root or specified bass note."
+            },
+            {
+              "id": "vl_avoid_parallel_fifths_octaves",
+              "description": "In styles that care about classical voice-leading (ballad, orchestral), penalize parallel perfect fifths and octaves between outer voices.",
+              "severity": "medium",
+              "style_dependent": true,
+              "exempt_styles": ["modern_jazz", "pop", "electronic"]
+            },
+            {
+              "id": "vl_top_note_stepwise_preference",
+              "description": "The top voice should move by step or common tone when possible, inheriting sc_stepwise_top_note from the analysis engine.",
+              "references": "sc_stepwise_top_note"
+            },
+            {
+              "id": "vl_bass_line_smoothness",
+              "description": "When the pattern has an active bass line (bass_movement_type != 'static'), preserve the bass contour shape while adapting to the new chord roots. A walking bass pattern should continue walking; a pedal tone should continue sustaining.",
+              "bass_movement_preservation": {
+                "static": "Place bass on target root (or specified slash bass) and sustain.",
+                "root_motion": "Bass moves to each new chord root.",
+                "walking": "Preserve the original step-pattern (up/down/chromatic) relative to each target chord root. Use the target chord's parent scale for diatonic walk-ups.",
+                "pedal": "Maintain the original pedal pitch if harmonically compatible, or transpose to the key-appropriate pedal.",
+                "line_cliche": "Preserve the chromatic or stepwise descent/ascent pattern, adjusting starting pitch to the new chord."
+              }
+            }
+          ]
+        },
+        {
+          "step": 6,
+          "name": "validation_and_conflict_resolution",
+          "description": "Check every remapped note against hard constraints and resolve conflicts.",
+          "checks": [
+            {
+              "id": "val_avoid_tone_check",
+              "description": "If a remapped note lands on an avoid_tone of the target chord, apply correction.",
+              "correction_strategies": [
+                "If the note is a structural tone that became an avoid tone due to quality change, move it by semitone to the nearest non-avoided degree. Example: natural 11 on a maj7 target → shift to #11 if style allows, or to 3 if not.",
+                "If the note is a surface tone, adjust its chromatic position to avoid the forbidden pitch while preserving contour direction.",
+                "Log the conflict and original intended degree for debugging."
+              ]
+            },
+            {
+              "id": "val_playability_check",
+              "description": "Run all hard_constraints from the analysis engine against the remapped voicing.",
+              "checks_applied": [
+                "hc_unplayable_span: verify hand span doesn't exceed limits.",
+                "hc_low_register_mud_cluster: verify no dense clusters below MIDI 48.",
+                "hc_cross_hand_chaos: verify hand assignment order.",
+                "hc_melody_minor9_strong_beat: if melody is present, verify no harsh clash.",
+                "hc_outside_chord_without_context: verify all non-chord tones are explainable."
+              ]
+            },
+            {
+              "id": "val_register_sanity",
+              "description": "Verify the overall register spread is reasonable. A pattern that originally spanned C3-C5 should not end up spanning C1-C3 after rearrangement.",
+              "max_register_shift_tolerance_semitones": 12,
+              "correction": "If the total register shift exceeds tolerance, redistribute octaves to bring the pattern closer to the original register range."
+            },
+            {
+              "id": "val_no_silent_note_dropping",
+              "description": "Every note in the source pattern must have a corresponding note in the output. If a note cannot be cleanly remapped, flag it with a warning rather than silently dropping it.",
+              "output_for_unresolved": {
+                "include_note": true,
+                "flag": "rearrangement_conflict",
+                "suggested_alternatives": ["array of possible pitches with scores"]
+              }
+            },
+            {
+              "id": "val_chord_tone_completeness",
+              "description": "After rearrangement, verify that the target chord's essential tones (priority_tones from chord_quality_rules) are represented. If the rearranged pattern is missing a guide tone, flag it as a warning.",
+              "severity": "medium",
+              "action": "warn_but_do_not_auto_add"
+            }
+          ]
+        },
+        {
+          "step": 7,
+          "name": "humanization_and_export_preparation",
+          "description": "Restore human-feel timing and prepare for MIDI export.",
+          "rules": [
+            {
+              "id": "exp_restore_humanize_offset",
+              "description": "Re-apply the humanize_offset_ticks to each note's quantized position to restore the original performer's micro-timing feel.",
+              "optional": true,
+              "user_control": "humanize_amount (0.0 = fully quantized, 1.0 = original timing)"
+            },
+            {
+              "id": "exp_velocity_curve_preservation",
+              "description": "The relative velocity profile (relative_to_bar_average and accent_type) should be applied to the output, scaled to the user's desired velocity range.",
+              "user_control": "velocity_range [min, max]"
+            },
+            {
+              "id": "exp_duration_adjustment",
+              "description": "If the target tempo differs from the source tempo, note durations are automatically adjusted by the tempo ratio. The quantized_beats values remain the same; only the tick/ms conversion changes.",
+              "note": "If the user requests a different articulation (more legato or staccato), apply a global duration multiplier."
+            },
+            {
+              "id": "exp_midi_output_format",
+              "description": "Convert all relative representations back to absolute MIDI events.",
+              "output_fields_per_note": [
+                "midi_pitch (integer 0-127)",
+                "onset_tick (integer)",
+                "duration_tick (integer)",
+                "velocity (integer 0-127)",
+                "channel (integer)",
+                "voice_assignment (for track routing if multi-track output)"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+
+    "user_control_parameters": {
+      "description": "Parameters the user can adjust to influence rearrangement behavior.",
+      "parameters": [
+        {
+          "name": "tension_level",
+          "type": "enum",
+          "values": ["conservative", "moderate", "rich", "dense"],
+          "default": "moderate",
+          "effect": "Controls which tension tones are allowed in the output. 'conservative' limits to chord tones + basic 9ths; 'dense' allows all available tensions per chord quality."
+        },
+        {
+          "name": "voicing_style_override",
+          "type": "string_or_null",
+          "values": ["shell", "rootless_A", "spread_ballad", "close_position", "block", null],
+          "default": null,
+          "effect": "If set, forces rearranged voicings to conform to this template. If null, preserves the original pattern's voicing style."
+        },
+        {
+          "name": "bass_behavior",
+          "type": "enum",
+          "values": ["root_only", "preserve_pattern", "walking", "pedal"],
+          "default": "preserve_pattern",
+          "effect": "'root_only' forces bass to chord roots. 'preserve_pattern' keeps the original bass movement type. 'walking' generates a walking bass. 'pedal' sustains a pedal tone."
+        },
+        {
+          "name": "register_center_midi",
+          "type": "integer_or_null",
+          "default": null,
+          "effect": "If set, shifts the overall register center of the output to this MIDI note. Useful for placing the pattern in a specific octave range."
+        },
+        {
+          "name": "humanize_amount",
+          "type": "number",
+          "range": [0.0, 1.0],
+          "default": 0.7,
+          "effect": "How much of the original micro-timing to restore. 0.0 = fully quantized; 1.0 = original timing."
+        },
+        {
+          "name": "velocity_range",
+          "type": "array [min, max]",
+          "default": [40, 110],
+          "effect": "The output velocity range. The relative velocity profile is scaled to fit within this range."
+        },
+        {
+          "name": "contour_preservation_strength",
+          "type": "number",
+          "range": [0.0, 1.0],
+          "default": 0.8,
+          "effect": "How strictly to preserve the original melodic contour. 1.0 = exact contour; lower values allow more freedom for voice-leading optimization."
+        },
+        {
+          "name": "avoid_tone_strictness",
+          "type": "enum",
+          "values": ["strict", "permissive", "style_dependent"],
+          "default": "style_dependent",
+          "effect": "'strict' enforces all avoid tones from chord_quality_rules. 'permissive' allows passing avoid tones on weak beats. 'style_dependent' follows the analysis engine's style_tension_preferences."
+        }
+      ]
+    },
+
+    "special_rearrangement_cases": {
+      "description": "Edge cases that require specific handling beyond the standard pipeline.",
+      "cases": [
+        {
+          "id": "src_same_quality_different_root",
+          "description": "Simplest case: same chord quality, different root (e.g., Cmaj7 → Ebmaj7). Pure degree mapping with transposition-like behavior, but still using degree mapping rather than interval transposition.",
+          "method": "Direct degree-to-degree mapping. Octave placement follows register rules."
+        },
+        {
+          "id": "src_quality_change_with_common_tones",
+          "description": "When source and target share common tones (e.g., Cmaj7 → Am7 share C, E, G), prefer holding common tones in the same voice.",
+          "method": "Identify common pitch classes between source and target chord tones. Assign common tones first, then remap remaining notes."
+        },
+        {
+          "id": "src_tritone_substitution_remap",
+          "description": "When the target chord is a tritone sub of a dominant chord in the source, guide tones (3 and b7) swap roles but maintain pitch proximity.",
+          "method": "The 3rd of the source becomes the b7 of the tritone sub, and vice versa. Other tones follow standard degree mapping.",
+          "example": {
+            "source": "G7 (G-B-D-F)",
+            "target": "Db7 (Db-F-Ab-Cb)",
+            "mapping": {
+              "B (3rd of G7)": "Cb/B (b7 of Db7) — enharmonic hold",
+              "F (b7 of G7)": "F (3rd of Db7) — common tone hold"
+            }
+          }
+        },
+        {
+          "id": "src_chord_to_slash_chord",
+          "description": "When the target is a slash chord (e.g., Cmaj7/E), the bass note is specified independently of the root.",
+          "method": "Map the bass voice to the specified slash bass note. Map upper voices normally using the root-based degree system. Verify no mud in low register between bass and lower inner voices."
+        },
+        {
+          "id": "src_more_complex_target",
+          "description": "Target chord has more extensions than source (e.g., source was Dm, target is Dm11).",
+          "method": "Map existing notes by degree. If the target has additional available tensions not present in the source, do NOT auto-add them. The rearrangement engine preserves the source pattern's density. Users can request enrichment separately."
+        },
+        {
+          "id": "src_simpler_target",
+          "description": "Target chord has fewer extensions than source (e.g., source was Cmaj9, target is C).",
+          "method": "Notes whose degrees don't exist in the simpler target (e.g., 9th, 7th) follow the tension_fallback_rules. Typically replaced with the nearest available chord tone."
+        },
+        {
+          "id": "src_pattern_longer_than_target_progression",
+          "description": "The selected pattern has more chord changes than the user's target progression.",
+          "method": "Truncate at the nearest phrase boundary. If no clean boundary exists, truncate at the last complete bar. Log the truncation for user review."
+        },
+        {
+          "id": "src_pattern_shorter_than_target_progression",
+          "description": "The user's target progression is longer than the selected pattern.",
+          "method": "Options: (1) loop the pattern, (2) extend by repeating the last phrase with variation, (3) fill remaining bars with a complementary pattern from the DB. Default: loop with a flag suggesting the user review the loop point."
+        },
+        {
+          "id": "src_meter_mismatch",
+          "description": "Source pattern is in 4/4 but target requires 3/4 (or vice versa).",
+          "method": "This is a complex transformation. For MVP, flag as incompatible and suggest the user select a pattern in the matching meter. For future versions, implement rhythmic re-gridding that preserves the rhythmic profile's character.",
+          "mvp_behavior": "reject_with_suggestion"
+        }
+      ]
+    }
+  },
+
+  "retrieval_matching_rules": {
+    "description": "Rules for finding the best pattern in the DB to match a user's request. This is the 'Retrieval' part of the PRD's Phase 3.",
+    "matching_dimensions": [
+      {
+        "dimension": "chord_quality_compatibility",
+        "weight": 0.25,
+        "description": "How well the source pattern's chord sequence quality types match the target. A pattern originally on ii-V-I is a better match for a target ii-V-I than a pattern from IV-V-I."
+      },
+      {
+        "dimension": "rhythmic_profile_similarity",
+        "weight": 0.20,
+        "description": "Match on dominant_subdivision, syncopation_level, and pattern_type."
+      },
+      {
+        "dimension": "density_match",
+        "weight": 0.10,
+        "description": "Similar note density (notes_per_beat_average)."
+      },
+      {
+        "dimension": "style_match",
+        "weight": 0.15,
+        "description": "Pattern style matches the user's requested style."
+      },
+      {
+        "dimension": "voicing_style_match",
+        "weight": 0.10,
+        "description": "Pattern voicing characteristics match user preference."
+      },
+      {
+        "dimension": "energy_profile_match",
+        "weight": 0.05,
+        "description": "Pattern energy trajectory matches desired feel."
+      },
+      {
+        "dimension": "length_compatibility",
+        "weight": 0.10,
+        "description": "Pattern length matches or is easily adaptable to target length."
+      },
+      {
+        "dimension": "register_compatibility",
+        "weight": 0.05,
+        "description": "Pattern register range is compatible with target instrument and desired register."
+      }
+    ],
+    "retrieval_workflow": [
+      "Parse user request: chord progression, style, density preference, length, etc.",
+      "Filter patterns by hard requirements: meter match, minimum length, instrument role.",
+      "Score remaining patterns on each matching_dimension.",
+      "Return top N candidates ranked by weighted total score.",
+      "For each candidate, preview the rearrangement result by running the rearrangement pipeline in preview mode (fast, no humanization).",
+      "Present previews to user for selection."
+    ]
+  },
+
+  "output_schema": {
+    "description": "The output of the rearrangement engine: a complete set of absolute MIDI events ready for export.",
+    "rearranged_pattern": {
+      "source_pattern_id": "string",
+      "target_chord_progression": [
+        {
+          "chord_label": "string",
+          "duration_beats": "number",
+          "bar_position": "integer"
+        }
+      ],
+      "notes": [
+        {
+          "midi_pitch": "integer (0-127)",
+          "onset_tick": "integer",
+          "duration_tick": "integer",
+          "velocity": "integer (0-127)",
+          "channel": "integer",
+          "voice_assignment": "string",
+          "original_chord_degree": "string (for debugging/display)",
+          "original_note_function": "string (for debugging/display)",
+          "rearrangement_flags": {
+            "tension_fallback_applied": "boolean",
+            "avoid_tone_correction_applied": "boolean",
+            "register_shift_applied": "boolean",
+            "contour_adjusted": "boolean",
+            "conflict_flag": "string_or_null"
+          }
+        }
+      ],
+      "metadata": {
+        "tempo_bpm": "number",
+        "meter": "string",
+        "total_bars": "integer",
+        "total_beats": "number",
+        "tpqn": "integer (ticks per quarter note for MIDI export)"
+      },
+      "validation_report": {
+        "total_notes": "integer",
+        "notes_with_conflicts": "integer",
+        "avoid_tone_corrections": "integer",
+        "register_adjustments": "integer",
+        "playability_warnings": ["string"],
+        "voice_leading_score": "0_to_1",
+        "chord_tone_completeness_per_chord": [
+          {
+            "chord_label": "string",
+            "missing_priority_tones": ["string"],
+            "completeness_score": "0_to_1"
+          }
+        ]
+      }
+    }
+  },
+
+  "developer_notes": [
+    "This module is designed to work in tandem with the Harmony Analyzer Rule DB v1.8. Do not duplicate rules already specified there.",
+    "The degree_translation rules cover the most common chord quality changes. Extend the quality_change_adaptation table as new chord types are encountered.",
+    "The tension_fallback_rules are conservative by default. For jazz contexts, consider allowing more tension preservation even when the target chord quality differs.",
+    "Voice-leading optimization (step 5) is the most computationally expensive part. For MVP, a greedy nearest-pitch approach is sufficient. For production, consider a global optimization that minimizes total voice motion across the entire progression.",
+    "The retrieval_matching_rules should be tuned empirically as the Pattern DB grows. Initial weights are estimates.",
+    "The contour_context fields are critical for natural-sounding surface tone rearrangement. Invest in accurate contour extraction during the conversion step.",
+    "For MVP, focus on single-instrument (piano) patterns in 4/4 time. Meter mismatch handling can be deferred.",
+    "The validation_report output is essential for debugging and for building a feedback loop to improve rearrangement quality over time.",
+    "Test extensively with ii-V-I progressions in all 12 keys as the baseline regression suite.",
+    "Test quality-change rearrangements: take a pattern from a major-key ii-V-I and remap it to a minor-key iiø-V-i to verify the adaptation rules work correctly.",
+    "The rearrangement engine should NEVER silently drop notes. Every note in the source pattern must produce a corresponding note in the output, even if flagged with a conflict.",
+    "Ghost notes (very low velocity) should be preserved during rearrangement; they contribute to groove feel.",
+    "When building the Pattern DB, extract patterns at multiple granularities: 1-bar, 2-bar, 4-bar, and full-phrase. Different retrieval scenarios need different lengths.",
+    "The humanize_offset_ticks preservation is what separates a mechanical-sounding output from a natural one. Treat it as a first-class feature, not an afterthought.",
+    "Consider storing the analysis engine's confidence scores alongside each pattern's originating_chord_sequence so retrieval can prefer patterns whose source analysis was high-confidence."
+  ],
+
+  "integration_points": {
+    "upstream": {
+      "module": "MIDI Harmony Analyzer Rule DB v1.8",
+      "consumes": [
+        "output_schema.segments (selected_label, structural_chord, surface_extensions, etc.)",
+        "chord_quality_rules (for degree mapping and validation)",
+        "hard_constraints (for rearrangement validation)",
+        "soft_constraints (for scoring rearrangement quality)",
+        "playability_constraints (for register and span checks)",
+        "voicing_templates (for voicing style reference)",
+        "progression_resolution_rules (for voice-leading optimization)",
+        "melody_alignment_rules (for melody protection during rearrangement)",
+        "enharmonic_interpretation_rules (for correct degree spelling)"
+      ]
+    },
+    "downstream": {
+      "module": "MIDI Export / Post-Processing Engine (to be designed)",
+      "provides": [
+        "output_schema.rearranged_pattern (absolute MIDI events)",
+        "validation_report (for post-processing decisions)",
+        "voice_assignment per note (for multi-track export)"
+      ]
+    },
+    "storage": {
+      "module": "Pattern Database",
+      "stores": "pattern_schema.pattern_unit objects",
+      "retrieves": "patterns by matching_dimensions query"
+    }
+  }
+}
